@@ -111,6 +111,12 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 		return stats{}, err
 	}
 	defer tst.close()
+	if err := checkEncodings(ref.encoding, tst.encoding); err != nil {
+		return stats{}, err
+	}
+	if w := versionWarning(ref.version, tst.version); w != "" {
+		log.Print(w)
+	}
 
 	// 2. Negotiate the table structure.
 	d1, err := ref.describe(ctx, opt.table)
@@ -121,23 +127,24 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	if err != nil {
 		return stats{}, err
 	}
-	p, err := negotiate(d1, d2, opt.columns)
+	// The reference server decides on common types for mismatching columns.
+	p, err := negotiate(d1, d2, opt.columns, func(c1, c2 column) (string, error) {
+		return ref.commonType(ctx, c1, c2)
+	})
 	if err != nil {
 		return stats{}, err
 	}
-	log.Printf("key: %s (%s); columns: %s", p.pk, p.pkType, strings.Join(p.cols, ", "))
-
-	// The table is resolved; now pin search_path so that both sides see the
-	// same objects while the comparison runs.
-	if err := ref.pinSearchPath(ctx, d1.schema); err != nil {
-		return stats{}, err
+	names := make([]string, len(p.cols))
+	for i, c := range p.cols {
+		names[i] = c.name
 	}
-	if err := tst.pinSearchPath(ctx, d2.schema); err != nil {
-		return stats{}, err
+	log.Printf("key: %s (%s); columns: %s", p.pk, p.pkType, strings.Join(names, ", "))
+	if len(p.ignored) > 0 {
+		log.Printf("ignored (present on one side only): %s", strings.Join(p.ignored, ", "))
 	}
 
-	q1 := buildQuery(d1.qualifiedName(), p, opt.filter)
-	q2 := buildQuery(d2.qualifiedName(), p, opt.filter)
+	q1 := buildQuery(d1.qualifiedName(), p, 0, opt.filter)
+	q2 := buildQuery(d2.qualifiedName(), p, 1, opt.filter)
 	log.Printf("reference query: %s", q1)
 	if q2 != q1 {
 		log.Printf("test query: %s", q2)
