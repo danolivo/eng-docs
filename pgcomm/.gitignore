@@ -1,0 +1,7 @@
+# build output
+/pgcmp
+# default report file
+pgcmp.out
+.DS_Store
+# the top-level C template ignores *.mod* (kernel modules)
+!go.mod
