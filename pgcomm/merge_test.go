@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -74,20 +75,51 @@ func TestBuildQuery(t *testing.T) {
 		{name: "name"},
 		{name: "Odd Col", cast: [2]string{"", "numeric(12,3)"}},
 	}}
-	got := buildQuery(`"public"."t"`, p, 0, "id > 10")
+	got := buildQuery(`"public"."t"`, p, 0, "id > 10", keyRange{})
 	want := `SELECT "id", ROW("name", "Odd Col")::text FROM "public"."t" WHERE (id > 10) ORDER BY "id"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = buildQuery(`"public"."t"`, p, 1, "")
+	got = buildQuery(`"public"."t"`, p, 1, "", keyRange{})
 	want = `SELECT "id", ROW("name", "Odd Col"::numeric(12,3))::text FROM "public"."t" ORDER BY "id"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = buildQuery(`"public"."t"`, &plan{pk: "id"}, 0, "")
+	got = buildQuery(`"public"."t"`, &plan{pk: "id"}, 0, "", keyRange{})
 	want = `SELECT "id", '()'::text FROM "public"."t" ORDER BY "id"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	lo, hi := int64(-5), int64(100)
+	got = buildQuery(`"public"."t"`, &plan{pk: "id"}, 0, "x = 1", keyRange{&lo, &hi})
+	want = `SELECT "id", '()'::text FROM "public"."t" WHERE (x = 1) AND "id" >= -5 AND "id" < 100 ORDER BY "id"`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestRangesFromBounds(t *testing.T) {
+	show := func(rs []keyRange) string {
+		var parts []string
+		for _, r := range rs {
+			parts = append(parts, "["+r.condition("k")+"]")
+		}
+		return strings.Join(parts, " ")
+	}
+	cases := []struct {
+		bounds []int64
+		want   string
+	}{
+		{nil, "[]"},
+		{[]int64{7}, "[]"},
+		{[]int64{1, 9}, "[]"}, // one bin: the whole key space
+		{[]int64{1, 5, 9}, "[k < 5] [k >= 5]"},
+		{[]int64{1, 5, 7, 9}, "[k < 5] [k >= 5 AND k < 7] [k >= 7]"},
+	}
+	for _, c := range cases {
+		if got := show(rangesFromBounds(c.bounds)); got != c.want {
+			t.Errorf("bounds %v: got %s, want %s", c.bounds, got, c.want)
+		}
 	}
 }
 

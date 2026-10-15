@@ -28,6 +28,7 @@ SET lc_monetary = 'C';
 SET quote_all_identifiers = on;
 SET client_encoding = 'UTF8';
 SET statement_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
 `
 
 const numericOID = 1700
@@ -136,7 +137,10 @@ type plan struct {
 // as a format_type string, or an error if there is none.
 type commonTypeFunc func(c1, c2 column) (string, error)
 
-func openSide(ctx context.Context, name, dsn string) (*side, error) {
+// openSide connects, applies the session settings and opens a read-only
+// REPEATABLE READ transaction. A non-empty snapshot is an exported snapshot
+// id: the transaction then sees exactly what the exporting one sees.
+func openSide(ctx context.Context, name, dsn, snapshot string) (*side, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: connect: %w", name, err)
@@ -162,6 +166,13 @@ func openSide(ctx context.Context, name, dsn string) (*side, error) {
 		return nil, fmt.Errorf("%s: begin: %w", name, err)
 	}
 	s.tx = tx
+	if snapshot != "" {
+		sql := "SET TRANSACTION SNAPSHOT '" + strings.ReplaceAll(snapshot, "'", "''") + "'"
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			s.close()
+			return nil, fmt.Errorf("%s: import snapshot: %w", name, err)
+		}
+	}
 	return s, nil
 }
 
@@ -408,8 +419,8 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 // the key and the server-side text form of the row, ordered by the key.
 // The row is ROW(c1, c2, ...)::text, i.e. record_out, which is exactly what
 // psql shows for a composite value. Columns whose types differ between the
-// sides are cast to their common type first.
-func buildQuery(qualifiedTable string, p *plan, side int, filter string) string {
+// sides are cast to their common type first. r restricts the key range.
+func buildQuery(qualifiedTable string, p *plan, side int, filter string, r keyRange) string {
 	pk := pgx.Identifier{p.pk}.Sanitize()
 	rowExpr := "'()'::text"
 	if len(p.cols) > 0 {
@@ -424,8 +435,15 @@ func buildQuery(qualifiedTable string, p *plan, side int, filter string) string 
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "SELECT %s, %s FROM %s", pk, rowExpr, qualifiedTable)
+	var conds []string
 	if f := strings.TrimSpace(filter); f != "" {
-		fmt.Fprintf(&b, " WHERE (%s)", f)
+		conds = append(conds, "("+f+")")
+	}
+	if c := r.condition(pk); c != "" {
+		conds = append(conds, c)
+	}
+	if len(conds) > 0 {
+		fmt.Fprintf(&b, " WHERE %s", strings.Join(conds, " AND "))
 	}
 	fmt.Fprintf(&b, " ORDER BY %s", pk)
 	return b.String()

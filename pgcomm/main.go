@@ -16,11 +16,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -40,6 +39,7 @@ type options struct {
 	columns    []string
 	filter     string
 	out        string
+	jobs       int
 }
 
 func main() {
@@ -55,9 +55,10 @@ func run() int {
 	flag.StringVar(&opt.dsn1, "dsn1", "", "connection string of the reference instance")
 	flag.StringVar(&opt.dsn2, "dsn2", "", "connection string of the instance under test")
 	flag.StringVar(&opt.table, "table", "", "table name, optionally schema-qualified")
-	flag.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: all columns of the reference table)")
+	flag.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: columns present on both sides)")
 	flag.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
 	flag.StringVar(&opt.out, "out", "pgcmp.out", "report file")
+	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram")
 	flag.Parse()
 
 	// Parsing stops at the first non-flag argument; everything after it
@@ -68,8 +69,8 @@ func run() int {
 		return exitError
 	}
 
-	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" {
-		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-out <file>]")
+	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" || opt.jobs < 1 {
+		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-out <file>]")
 		return exitError
 	}
 	for _, c := range strings.Split(cols, ",") {
@@ -101,12 +102,12 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	started := time.Now()
 
 	// 1. Connect both sides and align session settings.
-	ref, err := openSide(ctx, "reference", opt.dsn1)
+	ref, err := openSide(ctx, "reference", opt.dsn1, "")
 	if err != nil {
 		return stats{}, err
 	}
 	defer ref.close()
-	tst, err := openSide(ctx, "test", opt.dsn2)
+	tst, err := openSide(ctx, "test", opt.dsn2, "")
 	if err != nil {
 		return stats{}, err
 	}
@@ -143,14 +144,35 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 		log.Printf("ignored (present on one side only): %s", strings.Join(p.ignored, ", "))
 	}
 
-	q1 := buildQuery(d1.qualifiedName(), p, 0, opt.filter)
-	q2 := buildQuery(d2.qualifiedName(), p, 1, opt.filter)
-	log.Printf("reference query: %s", q1)
-	if q2 != q1 {
+	query := func(side int, r keyRange) string {
+		if side == 0 {
+			return buildQuery(d1.qualifiedName(), p, 0, opt.filter, r)
+		}
+		return buildQuery(d2.qualifiedName(), p, 1, opt.filter, r)
+	}
+	log.Printf("reference query: %s", query(0, keyRange{}))
+	if q2 := query(1, keyRange{}); q2 != query(0, keyRange{}) {
 		log.Printf("test query: %s", q2)
 	}
 
-	// 3. Open the report.
+	// 3. Split the key space by the histogram of the reference side.
+	ranges := []keyRange{{}}
+	if opt.jobs > 1 {
+		bounds, err := ref.histogram(ctx, d1, p.pk)
+		if err != nil {
+			return stats{}, err
+		}
+		if len(bounds) < 2 {
+			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
+				d1.qualifiedName(), p.pk)
+		} else {
+			ranges = rangesFromBounds(bounds)
+			log.Printf("parallel: %d workers, %d key ranges from the histogram",
+				min(opt.jobs, len(ranges)), len(ranges))
+		}
+	}
+
+	// 4. Open the report.
 	f, err := os.Create(opt.out)
 	if err != nil {
 		return stats{}, fmt.Errorf("create report: %w", err)
@@ -158,24 +180,14 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 4. Stream both sides concurrently and merge.
-	//
-	// errgroup cancels gctx as soon as any of the three goroutines fails;
-	// readers blocked on a full channel then wake up and exit. Wait returns
-	// the first error, which is the real cause.
-	g, gctx := errgroup.WithContext(ctx)
-	ch1 := make(chan row, bufferRows)
-	ch2 := make(chan row, bufferRows)
+	// 5. Compare: in the coordinator sessions, or in parallel workers.
 	var st stats
-
-	g.Go(func() error { return ref.stream(gctx, q1, ch1) })
-	g.Go(func() error { return tst.stream(gctx, q2, ch2) })
-	g.Go(func() error {
-		var err error
-		st, err = merge(ch1, ch2, w)
-		return err
-	})
-	if err := g.Wait(); err != nil {
+	if len(ranges) == 1 {
+		st, err = runRange(ctx, ref, tst, query(0, ranges[0]), query(1, ranges[0]), w)
+	} else {
+		st, err = runParallel(ctx, opt, ref, tst, ranges, query, filepath.Dir(opt.out), w)
+	}
+	if err != nil {
 		return st, err
 	}
 

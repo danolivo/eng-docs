@@ -14,6 +14,7 @@
 #
 # Usage: test/regress.sh            (from the pgcomm directory)
 #        IMAGE=postgres:18 KEEP=1 test/regress.sh   (keep the container)
+#        JOBS=4 test/regress.sh     (parallel mode where a histogram exists)
 
 set -euo pipefail
 
@@ -50,12 +51,26 @@ echo "--- server version $VERSION"
 echo "--- installing build tools"
 # Since PG 17 the source tarball no longer ships generated files, so the
 # build needs bison, flex and perl.
-docker exec -e DEBIAN_FRONTEND=noninteractive "$NAME" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential bison flex perl curl ca-certificates >/dev/null'
+docker exec -e DEBIAN_FRONTEND=noninteractive "$NAME" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential bison flex perl >/dev/null'
+
+# The tarball is cached on the host: the download is the slowest and the
+# least reliable step, and the same version is needed run after run.
+CACHE=${CACHE:-$HOME/.cache/pgcmp}
+TARBALL=$CACHE/postgresql-$VERSION.tar.gz
+if [ ! -s "$TARBALL" ]; then
+	echo "--- downloading postgresql-$VERSION.tar.gz"
+	mkdir -p "$CACHE"
+	curl -fsSL --retry 3 --connect-timeout 20 --speed-limit 10000 --speed-time 30 \
+		-o "$TARBALL.part" "https://ftp.postgresql.org/pub/source/v$VERSION/postgresql-$VERSION.tar.gz"
+	mv "$TARBALL.part" "$TARBALL"
+fi
+docker cp "$TARBALL" "$NAME:/tmp/src.tar.gz"
+docker exec "$NAME" chown postgres /tmp/src.tar.gz
 
 echo "--- building the regression suite from postgresql-$VERSION sources"
 docker exec -u postgres -w /tmp "$NAME" sh -c "
 	set -e
-	curl -fsSL https://ftp.postgresql.org/pub/source/v$VERSION/postgresql-$VERSION.tar.gz | tar xz
+	tar xzf src.tar.gz
 	cd postgresql-$VERSION
 	./configure -q --prefix=/usr/lib/postgresql/${VERSION%%.*} --without-icu --without-readline --without-zlib >/dev/null
 	make -s -C src/interfaces/libpq >/dev/null   # pg_regress links against it
@@ -95,11 +110,13 @@ echo "--- $(wc -l <"$WORK/tables" | tr -d ' ') of $TOTAL tables are eligible"
 
 ok=0
 rows=0
+par=0
 failed=()
 while IFS= read -r t; do
-	if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -out "$WORK/out" >"$WORK/log" 2>&1; then
+	if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -j "${JOBS:-1}" -out "$WORK/out" >"$WORK/log" 2>&1; then
 		ok=$((ok + 1))
 		rows=$((rows + $(sed -n 's/.*reference: \([0-9]*\) rows.*/\1/p' "$WORK/log")))
+		if grep -q 'parallel:' "$WORK/log"; then par=$((par + 1)); fi
 	else
 		failed+=("$t")
 		echo "FAIL $t"
@@ -108,5 +125,5 @@ while IFS= read -r t; do
 	fi
 done <"$WORK/tables"
 
-echo "--- $ok matched ($rows rows), ${#failed[@]} failed"
+echo "--- $ok matched ($rows rows; $par in parallel with -j ${JOBS:-1}), ${#failed[@]} failed"
 [ ${#failed[@]} -eq 0 ]

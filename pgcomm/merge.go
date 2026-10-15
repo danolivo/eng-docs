@@ -15,6 +15,14 @@ type stats struct {
 
 func (s stats) diffs() uint64 { return s.differ + s.onlyLeft + s.onlyRight }
 
+func (s *stats) add(o stats) {
+	s.rows1 += o.rows1
+	s.rows2 += o.rows2
+	s.differ += o.differ
+	s.onlyLeft += o.onlyLeft
+	s.onlyRight += o.onlyRight
+}
+
 // merge consumes two key-ordered streams and writes one report line per
 // mismatch: <key> <reference row> <test row>, with NULL standing for a
 // row that is absent on one side. It returns when both channels are closed.
