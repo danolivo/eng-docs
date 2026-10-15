@@ -216,11 +216,14 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 		return nil, fmt.Errorf("%s: columns of %s: %w", s.name, d.qualifiedName(), err)
 	}
 
+	// Only the first indnkeyatts entries of indkey are key columns; the rest
+	// are INCLUDE columns, which are not part of the key.
 	rows, err = s.tx.Query(ctx, `
 		SELECT a.attname
 		FROM pg_catalog.pg_index i
-		JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+		JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid
 		WHERE i.indrelid = $1 AND i.indisprimary
+		  AND a.attnum = ANY ((i.indkey::int2[])[0:i.indnkeyatts - 1])
 		ORDER BY pg_catalog.array_position(i.indkey::int2[], a.attnum)`, d.oid)
 	if err != nil {
 		return nil, fmt.Errorf("%s: primary key of %s: %w", s.name, d.qualifiedName(), err)
