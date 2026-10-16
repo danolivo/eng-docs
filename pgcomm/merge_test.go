@@ -123,10 +123,10 @@ func TestRangesFromBounds(t *testing.T) {
 	}
 }
 
-// fakeCommon stands in for the server: it knows one widening and nothing else.
+// fakeCommon stands in for the server: it knows one UNION and nothing else.
 func fakeCommon(c1, c2 column) (string, error) {
-	if c1.typeName == "numeric(10,2)" && c2.typeName == "numeric(12,3)" {
-		return "numeric(12,3)", nil
+	if c1.typeName == "numeric(10,2)" && c2.typeName == "integer" {
+		return "numeric", nil
 	}
 	return "", errors.New("cannot be matched")
 }
@@ -134,19 +134,19 @@ func fakeCommon(c1, c2 column) (string, error) {
 func TestNegotiate(t *testing.T) {
 	ref := &description{side: "reference", schema: "public", name: "t",
 		columns: []column{
-			{name: "id", typeOID: 23, typmod: -1, typeName: "integer"},
-			{name: "a", typeOID: 25, typmod: -1, typeName: "text"},
-			{name: "b", typeOID: 1700, typmod: 10<<16 | 2 + 4, typeName: "numeric(10,2)"},
-			{name: "only_ref", typeOID: 25, typmod: -1, typeName: "text"},
+			{name: "id", typeOID: 23, typeName: "integer"},
+			{name: "a", typeOID: 25, typeName: "text"},
+			{name: "b", typeOID: 1700, typeName: "numeric(10,2)"},
+			{name: "only_ref", typeOID: 25, typeName: "text"},
 		},
 	}
 	ref.pk = []column{ref.columns[0]}
 	tst := &description{side: "test", schema: "public", name: "t",
 		columns: []column{
-			{name: "only_test", typeOID: 25, typmod: -1, typeName: "text"},
-			{name: "b", typeOID: 1700, typmod: 10<<16 | 2 + 4, typeName: "numeric(10,2)"},
-			{name: "id", typeOID: 20, typmod: -1, typeName: "bigint"}, // other integer width is fine
-			{name: "a", typeOID: 25, typmod: -1, typeName: "text"},
+			{name: "only_test", typeOID: 25, typeName: "text"},
+			{name: "b", typeOID: 1700, typeName: "numeric(10,2)"},
+			{name: "id", typeOID: 20, typeName: "bigint"}, // other integer width is fine
+			{name: "a", typeOID: 25, typeName: "text"},
 		},
 	}
 	tst.pk = []column{tst.columns[2]}
@@ -177,24 +177,24 @@ func TestNegotiate(t *testing.T) {
 		t.Fatal("expected a missing column error")
 	}
 
-	// Differing types: the narrower side is cast to the common type.
-	tst.columns[1].typeName = "numeric(12,3)"
+	// Differing types: every side whose type is not the common one is cast.
+	tst.columns[1].typeName = "integer"
 	p, err = negotiate(ref, tst, nil, fakeCommon)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := p.cols[1]; b.cast != [2]string{"numeric(12,3)", ""} {
+	if b := p.cols[1]; b.cast != [2]string{"numeric", "numeric"} {
 		t.Fatalf("unexpected casts for b: %+v", b)
 	}
 
 	// No common type is an error.
-	tst.columns[1].typeName = "varchar(10)"
+	tst.columns[1].typeName = "character varying(10)"
 	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
 		t.Fatal("expected a no-common-type error")
 	}
 
 	// Non-integer key is rejected.
-	ref.pk = []column{{name: "id", typeOID: 25, typmod: -1, typeName: "text"}}
+	ref.pk = []column{{name: "id", typeOID: 25, typeName: "text"}}
 	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
 		t.Fatal("expected a key type error")
 	}
@@ -235,27 +235,5 @@ func TestMajorVersion(t *testing.T) {
 	}
 	if w := versionWarning("17.6", "18.0"); w == "" {
 		t.Error("different majors: expected a warning")
-	}
-}
-
-func TestWiderTypmod(t *testing.T) {
-	num := func(p, s int32) int32 { return (p<<16 | s&0x7ff) + 4 }
-	cases := []struct {
-		name string
-		oid  uint32
-		a, b int32
-		want int32
-	}{
-		{"numeric same scale", numericOID, num(10, 2), num(12, 2), num(12, 2)},
-		{"numeric wider scale", numericOID, num(10, 2), num(10, 3), num(11, 3)},
-		{"numeric negative scale", numericOID, num(5, -2), num(4, 1), num(8, 1)},
-		{"numeric unconstrained wins", numericOID, num(10, 2), -1, -1},
-		{"varchar length", 1043, 10 + 4, 20 + 4, 20 + 4},
-		{"timestamp precision", 1114, 3, 6, 6},
-	}
-	for _, c := range cases {
-		if got := widerTypmod(c.oid, c.a, c.b); got != c.want {
-			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
-		}
 	}
 }

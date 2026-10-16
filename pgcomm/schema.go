@@ -31,8 +31,6 @@ SET statement_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
 `
 
-const numericOID = 1700
-
 // Integer types accepted as a primary key: int2, int4, int8. The key is
 // read into int64, so the two sides may use different integer widths.
 var integerTypes = map[uint32]bool{21: true, 23: true, 20: true}
@@ -93,14 +91,12 @@ func checkEncodings(ref, test string) error {
 // typeOID is meaningful only on the server it came from: built-in types
 // have the same OIDs everywhere, but user-defined types (enums, domains,
 // extension types) get theirs at creation time. Across servers a type is
-// identified by baseName, which is comparable because both sessions use
-// the same search_path.
+// identified by typeName, which is comparable because both sessions use the
+// same search_path.
 type column struct {
 	name     string
 	typeOID  uint32
-	typmod   int32
 	typeName string // format_type(atttypid, atttypmod), e.g. numeric(10,2)
-	baseName string // format_type(atttypid, NULL), e.g. numeric
 }
 
 // description is what one side knows about the table.
@@ -218,9 +214,8 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	}
 
 	rows, err := s.tx.Query(ctx, `
-		SELECT a.attname, a.atttypid, a.atttypmod,
-		       pg_catalog.format_type(a.atttypid, a.atttypmod),
-		       pg_catalog.format_type(a.atttypid, NULL)
+		SELECT a.attname, a.atttypid,
+		       pg_catalog.format_type(a.atttypid, a.atttypmod)
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, d.oid)
@@ -229,7 +224,7 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	}
 	d.columns, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (column, error) {
 		var c column
-		err := r.Scan(&c.name, &c.typeOID, &c.typmod, &c.typeName, &c.baseName)
+		err := r.Scan(&c.name, &c.typeOID, &c.typeName)
 		return c, err
 	})
 	if err != nil {
@@ -262,36 +257,34 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	return d, nil
 }
 
-// commonType asks this server for the most general type of two column
-// definitions.
+// commonType asks this server for the common type of two column definitions:
+// the type PostgreSQL itself gives a UNION of the two. The decision is left
+// to the server entirely, type modifier included:
 //
-// Same base type: the wider type modifier wins (varchar(10) vs varchar(20)
-// gives varchar(20), numeric(10,2) vs numeric(12,3) gives numeric(12,3)).
+//	int4          + int8          -> bigint
+//	timestamp     + timestamptz   -> timestamp with time zone
+//	numeric(10,2) + numeric(12,3) -> numeric      (different modifiers are dropped)
+//	integer       + text          -> error: no unambiguous mapping
 //
-// Different base types: PostgreSQL picks the type exactly as it does for
-// UNION (int4 vs int8 gives int8, timestamp vs timestamptz gives
-// timestamptz); no such type means there is no unambiguous mapping. If the
-// winner is one side's own type, that side's full definition is kept, so
-// int4 vs numeric(10,2) compares as numeric(10,2) on both sides.
+// Casting to such a type never loses data. It may make equal values print
+// differently (15.50 vs 15.500 as numeric), which shows up as a mismatch,
+// never as a false match.
 //
-// s must be the side c1 came from: c1.typeOID is used on it, c2.typeOID is
-// never used. Types are matched across the servers by name only.
+// The result type is read from the description of the prepared UNION:
+// pg_typeof() would give the type without its modifier.
+//
+// s must be the side c1 came from; types are matched across the servers by
+// name only.
 func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
-	if c1.baseName == c2.baseName {
-		return s.formatType(ctx, c1.typeOID, widerTypmod(c1.typeOID, c1.typmod, c2.typmod))
-	}
-
-	// The probe may fail ("UNION types ... cannot be matched"); run it under
-	// a savepoint so that the failure does not abort the whole transaction.
+	// Preparing may fail ("UNION types ... cannot be matched"); do it under a
+	// savepoint so that the failure does not abort the whole transaction.
 	sp, err := s.tx.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
-	var base string
-	err = sp.QueryRow(ctx, fmt.Sprintf(
-		"SELECT pg_catalog.format_type(pg_catalog.pg_typeof(x)::oid, NULL) "+
-			"FROM (SELECT NULL::%s UNION ALL SELECT NULL::%s) s(x) LIMIT 1",
-		c1.typeName, c2.typeName)).Scan(&base)
+	sql := fmt.Sprintf("SELECT x FROM (SELECT NULL::%s UNION ALL SELECT NULL::%s) s(x)",
+		c1.typeName, c2.typeName)
+	sd, err := s.conn.PgConn().Prepare(ctx, "", sql, nil)
 	if err != nil {
 		_ = sp.Rollback(ctx)
 		return "", err
@@ -300,48 +293,10 @@ func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
 		return "", err
 	}
 
-	switch base {
-	case c1.baseName:
-		return c1.typeName, nil
-	case c2.baseName:
-		return c2.typeName, nil
-	}
-	return base, nil
-}
-
-func (s *side) formatType(ctx context.Context, oid uint32, typmod int32) (string, error) {
+	f := sd.Fields[0]
 	var name string
-	err := s.tx.QueryRow(ctx, "SELECT pg_catalog.format_type($1, $2)", oid, typmod).Scan(&name)
+	err = s.tx.QueryRow(ctx, "SELECT pg_catalog.format_type($1, $2)", f.DataTypeOID, f.TypeModifier).Scan(&name)
 	return name, err
-}
-
-// widerTypmod returns the type modifier that can hold values of both.
-// -1 means "no modifier" and always wins. For numeric the modifier packs
-// precision and scale, so both are widened; for the other types with a
-// modifier (char/varchar length, time/timestamp precision, bit length) the
-// larger number is the wider one.
-func widerTypmod(typeOID uint32, a, b int32) int32 {
-	if a == -1 || b == -1 {
-		return -1
-	}
-	if typeOID != numericOID {
-		return max(a, b)
-	}
-	p1, s1 := numericPS(a)
-	p2, s2 := numericPS(b)
-	scale := max(s1, s2)
-	precision := max(p1-s1, p2-s2) + scale
-	if precision < 1 || precision > 1000 {
-		return -1
-	}
-	return (precision<<16 | scale&0x7ff) + 4
-}
-
-// numericPS decodes a numeric typmod: ((precision << 16) | scale) + 4, where
-// the scale is an 11-bit signed number (negative scales exist since PG 15).
-func numericPS(typmod int32) (precision, scale int32) {
-	t := typmod - 4
-	return (t >> 16) & 0xffff, ((t & 0x7ff) ^ 1024) - 1024
 }
 
 // negotiate checks that both descriptions agree on the primary key and maps
