@@ -172,7 +172,24 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 		}
 	}
 
-	// 4. Open the report.
+	// 4. Check that each side will read the rows in key order through the
+	// primary key index rather than scan and sort the table.
+	for i, s := range []*side{ref, tst} {
+		qs := make([]string, len(ranges))
+		for j, r := range ranges {
+			qs[j] = query(i, r)
+		}
+		table := []*description{d1, d2}[i].qualifiedName()
+		w, err := s.checkPlans(ctx, table, qs)
+		if err != nil {
+			return stats{}, err
+		}
+		if w != "" {
+			log.Print(w)
+		}
+	}
+
+	// 5. Open the report.
 	f, err := os.Create(opt.out)
 	if err != nil {
 		return stats{}, fmt.Errorf("create report: %w", err)
@@ -180,7 +197,7 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 5. Compare: in the coordinator sessions, or in parallel workers.
+	// 6. Compare: in the coordinator sessions, or in parallel workers.
 	var st stats
 	if len(ranges) == 1 {
 		st, err = runRange(ctx, ref, tst, query(0, ranges[0]), query(1, ranges[0]), w)

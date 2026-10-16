@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -197,6 +198,33 @@ func TestNegotiate(t *testing.T) {
 	ref.pk = []column{{name: "id", typeOID: 25, typeName: "text"}}
 	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
 		t.Fatal("expected a key type error")
+	}
+}
+
+func TestPlanShape(t *testing.T) {
+	cases := []struct {
+		json    string
+		shape   string
+		seqScan bool
+	}{
+		{`{"Node Type": "Index Scan"}`, "Index Scan", false},
+		{`{"Node Type": "Sort", "Plans": [{"Node Type": "Seq Scan"}]}`, "Sort -> Seq Scan", true},
+		{`{"Node Type": "Gather Merge", "Plans": [{"Node Type": "Sort",
+		   "Plans": [{"Node Type": "Seq Scan", "Parallel Aware": true}]}]}`,
+			"Gather Merge -> Sort -> Parallel Seq Scan", true},
+		{`{"Node Type": "Sort", "Plans": [{"Node Type": "Bitmap Heap Scan",
+		   "Plans": [{"Node Type": "Bitmap Index Scan"}]}]}`,
+			"Sort -> Bitmap Heap Scan -> Bitmap Index Scan", false}, // sorts a range only
+	}
+	for _, c := range cases {
+		var n planNode
+		if err := json.Unmarshal([]byte(c.json), &n); err != nil {
+			t.Fatal(err)
+		}
+		shape, seq := planShape(n)
+		if shape != c.shape || seq != c.seqScan {
+			t.Errorf("got %q %v, want %q %v", shape, seq, c.shape, c.seqScan)
+		}
 	}
 }
 

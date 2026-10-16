@@ -98,4 +98,23 @@ done
 rc=0; run "$WORK/nh" -table nohist -j 4 || rc=$?; check "no histogram: match" 0 $rc
 grep -q "no histogram" "$WORK/nh.log" && echo "ok   warning printed" || { echo "FAIL no warning"; FAILED=1; }
 
+echo "--- plan check: index usable, no warning"
+if grep -h "sequential scan" "$WORK/j1.log" "$WORK/j4.log"; then
+	echo "FAIL unexpected plan warning"; FAILED=1
+else echo "ok   no plan warning"; fi
+
+echo "--- plan check: index scans disabled on the test side"
+sql "$D2" "ALTER DATABASE postgres SET enable_indexscan = off"
+sql "$D2" "ALTER DATABASE postgres SET enable_bitmapscan = off"
+rc=0; run "$WORK/s1" -table big -j 1 || rc=$?; check "-j 1 still finds differences" 1 $rc
+grep -q "test: .* sequential scan and sorted in full" "$WORK/s1.log" \
+	&& echo "ok   -j 1 warns about a full sort" || { echo "FAIL -j 1: no warning"; FAILED=1; }
+grep -q "reference: .* sequential scan" "$WORK/s1.log" \
+	&& { echo "FAIL reference side warned"; FAILED=1; } || echo "ok   reference side does not warn"
+rc=0; run "$WORK/s4" -table big -j 4 || rc=$?
+grep -q "test: 100 of 100 key range queries .* sequential scan" "$WORK/s4.log" \
+	&& echo "ok   -j 4 warns with a range count" || { echo "FAIL -j 4: no warning"; FAILED=1; }
+cmp -s "$WORK/j1" "$WORK/s4" && echo "ok   report unchanged" || { echo "FAIL report changed"; FAILED=1; }
+sql "$D2" "ALTER DATABASE postgres RESET ALL"
+
 [ $FAILED -eq 0 ] && echo "--- all checks passed" || { echo "--- FAILED"; exit 1; }
