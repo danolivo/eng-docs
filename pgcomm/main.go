@@ -97,7 +97,7 @@ func run() int {
 	flag.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
 	flag.StringVar(&opt.out, "out", "pgcmp.out", "report file")
 	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram of the (first) key column")
-	opt.blockMem = 256 << 20
+	opt.blockMem = 64 << 20
 	flag.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
 	flag.Parse()
 
