@@ -213,6 +213,18 @@ func TestNegotiate(t *testing.T) {
 		t.Fatalf("unexpected key: %+v", p.key)
 	}
 
+	// regproc prints overloaded functions ambiguously: the key text and the
+	// bounds go through regprocedure.
+	ref.pk = []column{{name: "id", typeOID: 24, typeName: "regproc", baseType: "regproc"}}
+	tst.pk = []column{{name: "id", typeOID: 24, typeName: "regproc", baseType: "regproc"}}
+	p, err = negotiate(ref, tst, nil, fakeCommon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := p.key[0]; k.base != [2]string{"regprocedure", "regprocedure"} || k.cast != [2]string{"regprocedure", "regprocedure"} {
+		t.Fatalf("unexpected key: %+v", k)
+	}
+
 	// Composite key: also hash; an integer column of different widths is
 	// cast to the common type, and no key column is compared as data.
 	ref.pk = []column{ref.columns[0], ref.columns[1]}

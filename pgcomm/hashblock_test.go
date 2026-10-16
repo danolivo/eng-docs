@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -78,20 +79,39 @@ func TestHashQueries(t *testing.T) {
 	}
 	h := &hashStrategy{tables: [2]string{`"public"."r"`, `"public"."t"`}, p: p, filter: "v <> ''"}
 
-	got := h.refQuery()
-	want := `SELECT ROW("id"::bigint, "Name")::text, "id"::text, "Name"::text, ROW("v")::text FROM "public"."r"` +
+	all := textRange{}
+	got := h.refQuery(all)
+	want := `SELECT ROW("id"::bigint, "Name")::text, "id"::integer::text, "Name"::character varying::text, ROW("v")::text FROM "public"."r"` +
 		` WHERE (v <> '') ORDER BY "public"."r"."id", "public"."r"."Name"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = h.testQuery(true, true)
+
+	// A range restricts the first key column on both sides, in the column
+	// type of each side, with the bound quoted as a literal.
+	lo, hi := "1", "it's"
+	got = h.refQuery(textRange{&lo, &hi})
+	want = `SELECT ROW("id"::bigint, "Name")::text, "id"::integer::text, "Name"::character varying::text, ROW("v")::text FROM "public"."r"` +
+		` WHERE (v <> '') AND "id" >= '1'::integer AND "id" < 'it''s'::integer ORDER BY "public"."r"."id", "public"."r"."Name"`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	got = h.testQuery(textRange{lo: &lo}, true, true)
+	want = `SELECT ROW("id", "Name")::text, ROW("v")::text FROM "public"."t"` +
+		` WHERE (v <> '') AND "id" >= '1'::bigint AND ("id", "Name") > ($1::bigint, $2::text) AND ("id", "Name") <= ($3::bigint, $4::text)` +
+		` ORDER BY "public"."t"."id", "public"."t"."Name"`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+
+	got = h.testQuery(all, true, true)
 	want = `SELECT ROW("id", "Name")::text, ROW("v")::text FROM "public"."t"` +
 		` WHERE (v <> '') AND ("id", "Name") > ($1::bigint, $2::text) AND ("id", "Name") <= ($3::bigint, $4::text)` +
 		` ORDER BY "public"."t"."id", "public"."t"."Name"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = h.testQuery(false, true)
+	got = h.testQuery(all, false, true)
 	want = `SELECT ROW("id", "Name")::text, ROW("v")::text FROM "public"."t"` +
 		` WHERE (v <> '') AND ("id", "Name") <= ($1::bigint, $2::text) ORDER BY "public"."t"."id", "public"."t"."Name"`
 	if got != want {
@@ -102,13 +122,45 @@ func TestHashQueries(t *testing.T) {
 	h = &hashStrategy{tables: [2]string{`"r"`, `"t"`}, p: &plan{
 		key: []keyCol{{colPlan: colPlan{name: "k"}, base: [2]string{"uuid", "uuid"}}},
 	}}
-	got = h.testQuery(true, false)
+	got = h.testQuery(all, true, false)
 	want = `SELECT ROW("k")::text, '()'::text FROM "t" WHERE "k" > $1::uuid ORDER BY "t"."k"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 	if got, want := h.query(1), `SELECT ROW("k")::text, '()'::text FROM "t" ORDER BY "t"."k"`; got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestSplitBounds(t *testing.T) {
+	show := func(lo, hi []*string) string {
+		var parts []string
+		for i := range lo {
+			l, h := "-inf", "+inf"
+			if lo[i] != nil {
+				l = *lo[i]
+			}
+			if hi[i] != nil {
+				h = *hi[i]
+			}
+			parts = append(parts, "["+l+","+h+")")
+		}
+		return strings.Join(parts, " ")
+	}
+	cases := []struct {
+		bounds []string
+		want   string
+	}{
+		{nil, "[-inf,+inf)"},
+		{[]string{"m"}, "[-inf,+inf)"},
+		{[]string{"a", "z"}, "[-inf,+inf)"},
+		{[]string{"a", "m", "z"}, "[-inf,m) [m,+inf)"},
+		{[]string{"a", "f", "m", "z"}, "[-inf,f) [f,m) [m,+inf)"},
+	}
+	for _, c := range cases {
+		if got := show(splitBounds(c.bounds)); got != c.want {
+			t.Errorf("bounds %v: got %s, want %s", c.bounds, got, c.want)
+		}
 	}
 }
 

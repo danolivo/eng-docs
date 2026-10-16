@@ -52,16 +52,18 @@ run() {
 			fail "$t -mem $mem: got '$got', expected '$counts'"; sed 's/^/    /' "$WORK/log"; return
 		fi
 	fi
-	pass "$t -mem $mem ($(grep -o 'blocks: [0-9]*' "$WORK/log"))"
+	pass "$t -mem $mem $* ($(grep -o 'blocks: [0-9]*' "$WORK/log"))"
 }
 
-# same <table>: the small-block and big-block reports hold the same lines.
+# same <table> [mem mem]: two runs of a table with different -mem (and
+# maybe -j) hold the same report lines. Default: 1 MiB and 256 MiB blocks.
 same() {
-	if diff <(sort "$WORK/$1.1.out") <(sort "$WORK/$1.256.out") >/dev/null; then
-		pass "$1: same report lines for 1 MiB and 256 MiB blocks"
+	local a=${2:-1} b=${3:-256}
+	if diff <(sort "$WORK/$1.$a.out") <(sort "$WORK/$1.$b.out") >/dev/null; then
+		pass "$1: same report lines for -mem $a and -mem $b"
 	else
-		fail "$1: reports differ between block sizes"
-		diff <(sort "$WORK/$1.1.out") <(sort "$WORK/$1.256.out") | head | sed 's/^/    /'
+		fail "$1: reports differ between -mem $a and -mem $b"
+		diff <(sort "$WORK/$1.$a.out") <(sort "$WORK/$1.$b.out") | head | sed 's/^/    /'
 	fi
 }
 
@@ -128,6 +130,33 @@ sql "$D2" "INSERT INTO t_enum VALUES ('red', -1, 0, 'min'), ('red', 0, 0, 'min')
 both "CREATE TABLE t_keyonly (a text, b date, PRIMARY KEY (a, b))"
 both "INSERT INTO t_keyonly SELECT 'x' || (g % 100), date '2000-01-01' + g FROM generate_series(1, $ROWS) g"
 
+# 8a. char(n) and bit(n) keys: a bound cast to the type without its
+#     modifier must not turn into char(1) or bit(1) and get truncated.
+both "CREATE TABLE t_char (k char(12) PRIMARY KEY, n int, v text)"
+both "INSERT INTO t_char SELECT 'c' || lpad(g::text, 8, '0'), g, md5(g::text) FROM generate_series(1, $ROWS) g"
+plant t_char v
+sql "$D2" "INSERT INTO t_char VALUES ('a', 0, 'min'), ('b', 0, 'min'), ('x', 0, 'max'), ('y', 0, 'max')"
+both "CREATE TABLE t_bit (k bit(24) PRIMARY KEY, n int, v text)"
+both "INSERT INTO t_bit SELECT (g + 16)::bit(24), g, md5(g::text) FROM generate_series(1, $ROWS) g"
+plant t_bit v
+sql "$D2" "INSERT INTO t_bit VALUES (0::bit(24), 0, 'min'), (1::bit(24), 0, 'min'), ((1 << 23)::bit(24), 0, 'max'), (((1 << 24) - 1)::bit(24), 0, 'max')"
+
+# 9. A first key column whose histogram repeats a bound: with statistics
+#    target 5 the MCV list holds 5 of the 6 heavy values, the sixth stays in
+#    the histogram and spans two bins.
+both "CREATE TABLE t_dup (a text, b int, n int, v text, PRIMARY KEY (a, b))"
+both "ALTER TABLE t_dup ALTER COLUMN a SET STATISTICS 5"
+both "INSERT INTO t_dup SELECT CASE WHEN g % 100 < 72 THEN 'h' || (g % 100) / 12 ELSE 'x' || lpad((g % 1000)::text, 4, '0') END, g, g, md5(g::text) FROM generate_series(1, $ROWS) g"
+plant t_dup v
+sql "$D2" "INSERT INTO t_dup VALUES ('a', 1, 0, 'min'), ('a', 2, 0, 'min'), ('zz', 1, 0, 'max'), ('zz', 2, 0, 'max')"
+
+# 10. Partitioned tables and inheritance parents are not supported yet: a
+#     SELECT from the parent returns the rows of the children too.
+both "CREATE TABLE t_part (d date, s text, PRIMARY KEY (d, s)) PARTITION BY RANGE (d)"
+both "CREATE TABLE t_part_1 PARTITION OF t_part DEFAULT"
+both "CREATE TABLE t_inh (k text PRIMARY KEY)"
+both "CREATE TABLE t_inh_child (k text PRIMARY KEY) INHERITS (t_inh)"
+
 both "CREATE TABLE t_same (k uuid PRIMARY KEY, v text)"
 both "INSERT INTO t_same SELECT md5(g::text)::uuid, repeat('x', g % 50) FROM generate_series(1, $ROWS) g"
 
@@ -145,10 +174,44 @@ run t_keyonly 1 0 ""
 run t_same 1 0 ""
 
 echo "--- planted differences: 3 differ, 3 only in reference, 4 only in test"
-for t in t_text t_comp t_uuid t_ts t_num t_enum; do
+for t in t_text t_comp t_uuid t_ts t_num t_enum t_char t_bit t_dup; do
 	run "$t" 1 1 "3 3 4"
 	run "$t" 256 1 "3 3 4"
 	same "$t"
+done
+
+echo "--- parallel: the same lines as a sequential run"
+for t in t_text t_comp t_uuid t_ts t_num t_enum t_char t_bit t_dup; do
+	run "$t" 512kB 1 "3 3 4" -j 4
+	if [ "$t" = t_enum ]; then
+		# Three values, all of them most common: no histogram.
+		grep -q 'no histogram' "$WORK/log" && pass "$t: no histogram, sequential" || fail "$t: expected a no-histogram warning"
+	else
+		grep -q 'parallel: ' "$WORK/log" && pass "$t: $(grep -o '[0-9]* key ranges' "$WORK/log")" ||
+			{ fail "$t: did not run in parallel"; sed 's/^/    /' "$WORK/log"; }
+	fi
+	same "$t" 512kB 256
+done
+B=$(sql "$D1" "SELECT array_length(histogram_bounds::text::text[], 1) FROM pg_stats WHERE tablename = 't_dup' AND attname = 'a'")
+D=$(sql "$D1" "SELECT count(DISTINCT b) FROM pg_stats, unnest(histogram_bounds::text::text[]) b WHERE tablename = 't_dup' AND attname = 'a'")
+"$BIN" -dsn1 "$D1" -dsn2 "$D2" -table t_dup -j 4 -out "$WORK/dup.out" >"$WORK/log" 2>&1 || true
+if [ "$D" -lt "$B" ] && grep -q "parallel: [0-9]* workers, $((D - 1)) key ranges" "$WORK/log"; then
+	pass "t_dup: $B histogram bounds, $D distinct, $((D - 1)) ranges"
+else
+	fail "t_dup: $B bounds, $D distinct: $(grep 'parallel:' "$WORK/log")"
+fi
+
+echo "--- partitioned tables and inheritance parents are refused; children are tables"
+for t in t_part:'partitioned table' t_inh:'inheritance children'; do
+	rc=0
+	"$BIN" -dsn1 "$D1" -dsn2 "$D2" -table "${t%%:*}" -out "$WORK/out" >"$WORK/log" 2>&1 || rc=$?
+	if [ $rc = 2 ] && grep -q "${t#*:}" "$WORK/log"; then pass "${t%%:*} refused"; else
+		fail "${t%%:*}: exit $rc"; sed 's/^/    /' "$WORK/log"; fi
+done
+for t in t_part_1 t_inh_child; do
+	rc=0
+	"$BIN" -dsn1 "$D1" -dsn2 "$D2" -table "$t" -out "$WORK/out" >"$WORK/log" 2>&1 || rc=$?
+	[ $rc = 0 ] && pass "$t compared" || { fail "$t: exit $rc"; sed 's/^/    /' "$WORK/log"; }
 done
 
 echo "--- skew and empty sides"
@@ -159,9 +222,5 @@ run t_empty 1 1 "0 0 1"
 
 echo "--- filter and explicit columns"
 run t_text 1 1 "1 1 3" -filter "k < 'key 00000003' OR k = 'zzz'" -columns v
-
-echo "--- parallel request falls back to sequential"
-run t_uuid 1 1 "3 3 4" -j 4
-grep -q 'needs a single-column integer key' "$WORK/log" && pass "-j warning" || fail "-j warning missing"
 
 [ $FAILED -eq 0 ] && echo "--- all checks passed" || { echo "--- FAILED"; exit 1; }

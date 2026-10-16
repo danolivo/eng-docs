@@ -35,29 +35,20 @@ func (r keyRange) condition(pk string) string {
 	return strings.Join(c, " AND ")
 }
 
-// rangesFromBounds turns histogram bounds b0 < b1 < ... < bk into k ranges,
-// one per bin: (-inf, b1), [b1, b2), ..., [b(k-1), +inf).
+// rangesFromBounds turns histogram bounds into one range per bin (see
+// splitBounds).
 func rangesFromBounds(b []int64) []keyRange {
-	if len(b) < 2 {
-		return []keyRange{{}}
-	}
-	rs := make([]keyRange, 0, len(b)-1)
-	for i := 1; i < len(b); i++ {
-		var r keyRange
-		if i > 1 {
-			r.lo = &b[i-1]
-		}
-		if i < len(b)-1 {
-			r.hi = &b[i]
-		}
-		rs = append(rs, r)
+	lo, hi := splitBounds(b)
+	rs := make([]keyRange, len(lo))
+	for i := range lo {
+		rs[i] = keyRange{lo[i], hi[i]}
 	}
 	return rs
 }
 
-// histogram returns the histogram bounds of the key column, or nil if the
-// table has not been analysed. The key is unique, so there are no most
-// common values and the histogram describes the whole table.
+// histogram returns the histogram bounds of the integer key column, or nil
+// if the table has not been analysed. The key is unique, so there are no
+// most common values and the histogram describes the whole table.
 func (s *side) histogram(ctx context.Context, d *description, col string) ([]int64, error) {
 	var b []int64
 	err := s.tx.QueryRow(ctx, `
@@ -72,6 +63,64 @@ func (s *side) histogram(ctx context.Context, d *description, col string) ([]int
 		return nil, fmt.Errorf("%s: histogram of %s.%s: %w", s.name, d.qualifiedName(), col, err)
 	}
 	return b, nil
+}
+
+// histogramText returns the histogram bounds of a column of any type as
+// text, or nil if the table has not been analysed.
+//
+// histogram_bounds is anyarray, which cannot be cast, subscripted or
+// unnested; its text is parsed as an array of typ, the column type. The
+// server also drops repeated bounds: a column that is not unique (the first
+// column of a composite key) may have a value frequent enough to span
+// several bins, and each repeat would make an empty range.
+//
+// The query runs under a savepoint: a type that cannot read its own text
+// back fails here, and the caller can go on without parallelism.
+func (s *side) histogramText(ctx context.Context, d *description, col, typ string) ([]string, error) {
+	sp, err := s.tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sp.Query(ctx, fmt.Sprintf(`
+		SELECT b::text
+		FROM (SELECT b, o, lag(b) OVER (ORDER BY o) AS prev
+		      FROM pg_catalog.pg_stats s,
+		           unnest(s.histogram_bounds::text::%s[]) WITH ORDINALITY AS u(b, o)
+		      WHERE s.schemaname = $1 AND s.tablename = $2 AND s.attname = $3
+		        AND NOT s.inherited) h
+		WHERE prev IS NULL OR b > prev
+		ORDER BY o`, typ),
+		d.schema, d.name, col)
+	var b []string
+	if err == nil {
+		b, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	}
+	if err != nil {
+		_ = sp.Rollback(ctx)
+		return nil, fmt.Errorf("%s: histogram of %s.%s: %w", s.name, d.qualifiedName(), col, err)
+	}
+	return b, sp.Commit(ctx)
+}
+
+// splitBounds turns histogram bounds b0 < b1 < ... < bk into k bins:
+// (-inf, b1), [b1, b2), ..., [b(k-1), +inf). The outer bins are open, so
+// rows outside a stale histogram are still covered. Fewer than two bounds
+// give one unbounded range.
+func splitBounds[T any](b []T) (lo, hi []*T) {
+	if len(b) < 2 {
+		return []*T{nil}, []*T{nil}
+	}
+	for i := 1; i < len(b); i++ {
+		var l, h *T
+		if i > 1 {
+			l = &b[i-1]
+		}
+		if i < len(b)-1 {
+			h = &b[i]
+		}
+		lo, hi = append(lo, l), append(hi, h)
+	}
+	return lo, hi
 }
 
 // isTooManyConnections reports whether a connection attempt was refused
@@ -111,16 +160,21 @@ func runRange(ctx context.Context, ref, tst *side, q1, q2 string, w io.Writer) (
 	return st, err
 }
 
-// runParallel compares the ranges with up to opt.jobs workers.
+// rangeFunc compares key range i in the given pair of sessions and writes
+// its report lines to w.
+type rangeFunc func(ctx context.Context, ref, tst *side, i int, w io.Writer) (stats, error)
+
+// runParallel compares n key ranges with up to opt.jobs workers; how one
+// range is compared is up to the strategy (compare).
 //
 // Each side exports the snapshot of its coordinator transaction, and every
 // worker imports it, so all sessions of one side see exactly the same data.
 // A worker is a pair of connections (reference + test) that takes ranges
 // from a queue one by one. Each range writes its report to a temporary
 // file; at the end the files are appended to w in range order, so the
-// report stays sorted by key.
-func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []keyRange,
-	query func(side int, r keyRange) string, tmpDir string, w io.Writer) (stats, error) {
+// report of a range-ordered strategy stays ordered.
+func runParallel(ctx context.Context, opt *options, ref, tst *side, n int,
+	compare rangeFunc, tmpDir string, w io.Writer) (stats, error) {
 
 	snap1, err := ref.exportSnapshot(ctx)
 	if err != nil {
@@ -135,7 +189,7 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []key
 		st   stats
 		path string
 	}
-	results := make([]result, len(ranges))
+	results := make([]result, n)
 	defer func() {
 		for _, r := range results {
 			if r.path != "" {
@@ -155,7 +209,7 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []key
 			p.tst.close()
 		}
 	}()
-	for n := 0; n < min(opt.jobs, len(ranges)); n++ {
+	for len(pairs) < min(opt.jobs, n) {
 		a, err := openSide(ctx, "reference", opt.dsn1, snap1)
 		if err == nil {
 			var b *side
@@ -166,7 +220,7 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []key
 			a.close()
 		}
 		if len(pairs) > 0 && isTooManyConnections(err) {
-			log.Printf("warning: only %d of %d workers could connect: %v", len(pairs), min(opt.jobs, len(ranges)), err)
+			log.Printf("warning: only %d of %d workers could connect: %v", len(pairs), min(opt.jobs, n), err)
 			break
 		}
 		return stats{}, err
@@ -177,7 +231,7 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []key
 	queue := make(chan int)
 	g.Go(func() error {
 		defer close(queue)
-		for i := range ranges {
+		for i := range n {
 			select {
 			case queue <- i:
 			case <-gctx.Done():
@@ -199,7 +253,7 @@ func runParallel(ctx context.Context, opt *options, ref, tst *side, ranges []key
 				}
 				results[i].path = f.Name()
 				bw := bufio.NewWriter(f)
-				st, err := runRange(gctx, a, b, query(0, ranges[i]), query(1, ranges[i]), bw)
+				st, err := compare(gctx, a, b, i, bw)
 				if err == nil {
 					err = bw.Flush()
 				}

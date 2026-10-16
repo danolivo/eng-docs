@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -31,6 +32,10 @@ import (
 // reading it, the socket fills up and the server waits until the next
 // block. No cursor and no repeated index descents.
 //
+// With -j > 1 the key space is first cut into ranges on the first key
+// column, by its histogram on the reference side, and every range runs the
+// block loop above in its own pair of sessions.
+//
 // This relies on both servers ordering the key the same way, which the
 // plan check verifies indirectly: a key whose ordering does not match its
 // index (a different collation) would be read with a sequential scan.
@@ -38,19 +43,49 @@ import (
 // Keys are matched by their text, ROW(k1, k2, ...)::text on both sides,
 // cast to the common type where the column types differ.
 type hashStrategy struct {
+	opt    *options
 	tables [2]string
 	p      *plan
 	filter string
 	mem    byteSize
+	ranges []textRange
 }
 
-func newHashStrategy(opt *options, d1, d2 *description, p *plan) *hashStrategy {
-	return &hashStrategy{
+// textRange is a half-open interval on the first key column,
+// lo <= k1 < hi, with the bounds as text; a nil bound is open.
+type textRange struct {
+	lo, hi *string
+}
+
+func newHashStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *description, p *plan) *hashStrategy {
+	h := &hashStrategy{
+		opt:    opt,
 		tables: [2]string{d1.qualifiedName(), d2.qualifiedName()},
 		p:      p,
 		filter: strings.TrimSpace(opt.filter),
 		mem:    opt.blockMem,
+		ranges: []textRange{{}},
 	}
+	if opt.jobs > 1 {
+		k := p.key[0]
+		bounds, err := ref.histogramText(ctx, d1, k.name, k.base[0])
+		switch {
+		case err != nil:
+			log.Printf("warning: %v; running without parallelism", err)
+		case len(bounds) < 2:
+			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
+				d1.qualifiedName(), k.name)
+		default:
+			lo, hi := splitBounds(bounds)
+			h.ranges = make([]textRange, len(lo))
+			for i := range lo {
+				h.ranges[i] = textRange{lo[i], hi[i]}
+			}
+			log.Printf("parallel: %d workers, %d key ranges from the histogram of %s",
+				min(opt.jobs, len(h.ranges)), len(h.ranges), k.name)
+		}
+	}
+	return h
 }
 
 func (h *hashStrategy) name() string {
@@ -66,22 +101,40 @@ func (h *hashStrategy) keyExpr(side int) string {
 	return "ROW(" + strings.Join(exprs, ", ") + ")::text"
 }
 
-// refQuery reads the whole reference side in key order: the key text, each
-// key column as text (the block bounds), and the row text.
-func (h *hashStrategy) refQuery() string {
-	cols := []string{h.keyExpr(0)}
-	for _, k := range h.p.key {
-		cols = append(cols, pgx.Identifier{k.name}.Sanitize()+"::text")
+// rangeConds restricts the first key column to range r on one side. The
+// bounds are inlined as literals of the column type of that side, so that
+// range queries can be planned and checked before the run.
+func (h *hashStrategy) rangeConds(side int, r textRange) []string {
+	k := h.p.key[0]
+	col := pgx.Identifier{k.name}.Sanitize()
+	lit := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'::" + k.base[side] }
+	var c []string
+	if r.lo != nil {
+		c = append(c, col+" >= "+lit(*r.lo))
 	}
-	cols = append(cols, rowExpr(h.p, 0))
-	return h.selectFrom(0, cols, nil)
+	if r.hi != nil {
+		c = append(c, col+" < "+lit(*r.hi))
+	}
+	return c
 }
 
-// testQuery reads one key range of the test side: lo and hi say whether
-// the range has a lower (exclusive) and an upper (inclusive) bound. The
-// lower bound takes parameters $1..$n, the upper one the next n.
-func (h *hashStrategy) testQuery(lo, hi bool) string {
-	var conds []string
+// refQuery reads range r of the reference side in key order: the key text,
+// each key column as text in its bound type (the block bounds), and the
+// row text.
+func (h *hashStrategy) refQuery(r textRange) string {
+	cols := []string{h.keyExpr(0)}
+	for _, k := range h.p.key {
+		cols = append(cols, pgx.Identifier{k.name}.Sanitize()+"::"+k.base[0]+"::text")
+	}
+	cols = append(cols, rowExpr(h.p, 0))
+	return h.selectFrom(0, cols, h.rangeConds(0, r))
+}
+
+// testQuery reads one block of range r on the test side: lo and hi say
+// whether the block has a lower (exclusive) and an upper (inclusive) bound.
+// The lower bound takes parameters $1..$n, the upper one the next n.
+func (h *hashStrategy) testQuery(r textRange, lo, hi bool) string {
+	conds := h.rangeConds(1, r)
 	next := 1
 	if lo {
 		conds = append(conds, h.bound(">", next))
@@ -132,19 +185,44 @@ func (h *hashStrategy) selectFrom(side int, cols, conds []string) string {
 
 func (h *hashStrategy) query(side int) string {
 	if side == 0 {
-		return h.refQuery()
+		return h.refQuery(textRange{})
 	}
-	return h.testQuery(false, false)
+	return h.testQuery(textRange{}, false, false)
 }
 
-// planQueries: the bounded test queries are not checked, they take
-// parameters. If the unbounded query reads the key index, a range of it
-// does too.
-func (h *hashStrategy) planQueries(side int) []string { return []string{h.query(side)} }
+// planQueries: one query per range. Block bounds are parameters and are
+// left out; if a range query reads the key index, a block of it does too.
+func (h *hashStrategy) planQueries(side int) []string {
+	qs := make([]string, len(h.ranges))
+	for i, r := range h.ranges {
+		if side == 0 {
+			qs[i] = h.refQuery(r)
+		} else {
+			qs[i] = h.testQuery(r, false, false)
+		}
+	}
+	return qs
+}
 
 func (h *hashStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (stats, error) {
 	var st stats
-	rows, err := ref.tx.Query(ctx, h.refQuery())
+	var err error
+	if len(h.ranges) == 1 {
+		st, err = h.compareRange(ctx, ref, tst, 0, w)
+	} else {
+		st, err = runParallel(ctx, h.opt, ref, tst, len(h.ranges), h.compareRange, filepath.Dir(h.opt.out), w)
+	}
+	if err == nil {
+		log.Printf("blocks: %d", st.blocks)
+	}
+	return st, err
+}
+
+// compareRange runs the block loop over range i in one pair of sessions.
+func (h *hashStrategy) compareRange(ctx context.Context, ref, tst *side, i int, w io.Writer) (stats, error) {
+	var st stats
+	r := h.ranges[i]
+	rows, err := ref.tx.Query(ctx, h.refQuery(r))
 	if err != nil {
 		return st, fmt.Errorf("%s: query: %w", ref.name, err)
 	}
@@ -176,9 +254,8 @@ func (h *hashStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (st
 	if err != nil {
 		return st, err
 	}
-	blocks := 0
 	for {
-		blocks++
+		st.blocks++
 		b.reset()
 		for have && !b.full() {
 			if err := b.add(vals[0], vals[nk+1]); err != nil {
@@ -191,30 +268,28 @@ func (h *hashStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (st
 		}
 		st.rows1 += uint64(len(b.rows))
 
-		// After the last reference row the range stays open to the right:
-		// the rest of the test side belongs to the last block.
+		// After the last reference row the block stays open to the right:
+		// the rest of the range on the test side belongs to it.
 		upper := hi
 		if !have {
 			upper = nil
 		}
-		if err := h.probe(ctx, tst, b, lo, upper, w, &st); err != nil {
+		if err := h.probe(ctx, tst, b, r, lo, upper, w, &st); err != nil {
 			return st, err
 		}
 		if err := b.finish(w, &st); err != nil {
 			return st, err
 		}
 		if !have {
-			break
+			return st, nil
 		}
 		lo = append(lo[:0], hi...)
 	}
-	log.Printf("blocks: %d", blocks)
-	return st, nil
 }
 
-// probe reads the test rows of the range (lo, hi] and matches them against
-// the block. A nil bound is open.
-func (h *hashStrategy) probe(ctx context.Context, tst *side, b *block, lo, hi []string, w io.Writer, st *stats) error {
+// probe reads the test rows of block (lo, hi] in range r and matches them
+// against the block. A nil bound is open.
+func (h *hashStrategy) probe(ctx context.Context, tst *side, b *block, r textRange, lo, hi []string, w io.Writer, st *stats) error {
 	args := make([]any, 0, len(lo)+len(hi))
 	for _, v := range lo {
 		args = append(args, v)
@@ -224,7 +299,7 @@ func (h *hashStrategy) probe(ctx context.Context, tst *side, b *block, lo, hi []
 	}
 	// A Go string parameter goes in text format, so the server parses the
 	// bound with the input function of the type it is cast to.
-	rows, err := tst.tx.Query(ctx, h.testQuery(lo != nil, hi != nil), args...)
+	rows, err := tst.tx.Query(ctx, h.testQuery(r, lo != nil, hi != nil), args...)
 	if err != nil {
 		return fmt.Errorf("%s: query: %w", tst.name, err)
 	}

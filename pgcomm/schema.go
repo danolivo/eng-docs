@@ -17,8 +17,12 @@ import (
 // search_path is "public" rather than the default "$user", public: $user
 // expands to the role name, which may differ between the two instances.
 // pg_catalog is still searched first implicitly.
+//
+// standard_conforming_strings is on by default; it is pinned because
+// histogram bounds of the hash strategy are inlined as '...' literals.
 const sessionSetup = `
 SET search_path = public;
+SET standard_conforming_strings = on;
 SET TimeZone = 'UTC';
 SET DateStyle = 'ISO, YMD';
 SET IntervalStyle = 'postgres';
@@ -98,7 +102,7 @@ type column struct {
 	name     string
 	typeOID  uint32
 	typeName string // format_type(atttypid, atttypmod), e.g. numeric(10,2)
-	baseType string // format_type(atttypid, NULL), e.g. numeric
+	baseType string // format_type(atttypid, -1), e.g. numeric; see describe
 }
 
 // description is what one side knows about the table.
@@ -233,11 +237,28 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	default:
 		return nil, fmt.Errorf("%s: %s is not a table (relkind %q)", s.name, d.qualifiedName(), relkind)
 	}
+	// A SELECT from an inheritance parent also returns the rows of its
+	// children, which the key does not cover. A partition or an inheritance
+	// child alone is an ordinary table.
+	var parent bool
+	err = s.tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT FROM pg_catalog.pg_inherits WHERE inhparent = $1)`, d.oid).Scan(&parent)
+	if err != nil {
+		return nil, fmt.Errorf("%s: inheritance of %s: %w", s.name, d.qualifiedName(), err)
+	}
+	if parent {
+		return nil, fmt.Errorf("%s: %s has inheritance children; not supported yet", s.name, d.qualifiedName())
+	}
 
+	// The base type is the type without its modifier, as a cast target for
+	// key bounds. It must be format_type(oid, -1), not (oid, NULL): with no
+	// modifier given, bpchar and bit come out as "character" and "bit",
+	// which mean char(1) and bit(1), and an explicit cast to them silently
+	// truncates the bound. With -1 they are bpchar and "bit", unconstrained.
 	rows, err := s.tx.Query(ctx, `
 		SELECT a.attname, a.atttypid,
 		       pg_catalog.format_type(a.atttypid, a.atttypmod),
-		       pg_catalog.format_type(a.atttypid, NULL)
+		       pg_catalog.format_type(a.atttypid, -1)
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, d.oid)
@@ -354,6 +375,14 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 				return nil, fmt.Errorf("primary key column %q: %w", k.name, err)
 			}
 			k.colPlan = cp
+			for side, c := range []column{d1.pk[i], d2.pk[i]} {
+				if alt, ok := unambiguousKeyType[c.typeOID]; ok {
+					k.base[side] = alt
+					if k.cast[side] == "" {
+						k.cast[side] = alt
+					}
+				}
+			}
 		}
 		p.key = append(p.key, k)
 	}
@@ -405,6 +434,19 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 		return nil, fmt.Errorf("table structures do not match:\n  %s", strings.Join(problems, "\n  "))
 	}
 	return p, nil
+}
+
+// unambiguousKeyType maps key types whose text does not identify the value
+// to a sibling type with the same values whose text does. regproc and
+// regoper print an overloaded function or operator by its bare name: two
+// keys of pg_aggregate both print as "avg", and "avg" does not read back.
+// regprocedure and regoperator add the argument types. The key text and the
+// block bounds use the sibling; the column keeps its own type, ordering
+// and index. Built-in types: matched by OID, which is the same everywhere
+// (a name may come quoted, under quote_all_identifiers).
+var unambiguousKeyType = map[uint32]string{
+	24:   "regprocedure", // regproc
+	2203: "regoperator",  // regoper
 }
 
 // keyList returns the key column names, comma-separated, for messages and

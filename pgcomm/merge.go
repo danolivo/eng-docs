@@ -63,7 +63,10 @@ func (m *mergeStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (s
 	if len(m.ranges) == 1 {
 		return runRange(ctx, ref, tst, m.rangeQuery(0, m.ranges[0]), m.rangeQuery(1, m.ranges[0]), w)
 	}
-	return runParallel(ctx, m.opt, ref, tst, m.ranges, m.rangeQuery, filepath.Dir(m.opt.out), w)
+	return runParallel(ctx, m.opt, ref, tst, len(m.ranges),
+		func(ctx context.Context, ref, tst *side, i int, w io.Writer) (stats, error) {
+			return runRange(ctx, ref, tst, m.rangeQuery(0, m.ranges[i]), m.rangeQuery(1, m.ranges[i]), w)
+		}, filepath.Dir(m.opt.out), w)
 }
 
 // merge consumes two key-ordered streams and writes one report line per

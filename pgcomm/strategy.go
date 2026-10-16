@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 )
 
 // strategy matches the rows of the two sides by primary key. compare()
@@ -16,7 +15,8 @@ import (
 //     histogram.
 //   - hashStrategy: any other key. Blocks of the reference side are hashed
 //     by the key text; each block is matched against the same key range of
-//     the test side. The client never orders keys.
+//     the test side. The client never orders keys. Parallel ranges come
+//     from the histogram of the first key column.
 type strategy interface {
 	// name is shown in the log.
 	name() string
@@ -34,10 +34,7 @@ func newStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *descripti
 	if p.intKey {
 		return newMergeStrategy(ctx, opt, ref, d1, d2, p)
 	}
-	if opt.jobs > 1 {
-		log.Printf("warning: parallel mode needs a single-column integer key; running sequentially")
-	}
-	return newHashStrategy(opt, d1, d2, p), nil
+	return newHashStrategy(ctx, opt, ref, d1, d2, p), nil
 }
 
 type stats struct {
@@ -45,6 +42,7 @@ type stats struct {
 	differ       uint64 // same key, different row text
 	onlyLeft     uint64 // key present only on the reference side
 	onlyRight    uint64 // key present only on the test side
+	blocks       uint64 // hash strategy: blocks compared
 }
 
 func (s stats) diffs() uint64 { return s.differ + s.onlyLeft + s.onlyRight }
@@ -55,6 +53,7 @@ func (s *stats) add(o stats) {
 	s.differ += o.differ
 	s.onlyLeft += o.onlyLeft
 	s.onlyRight += o.onlyRight
+	s.blocks += o.blocks
 }
 
 // writeDiff writes one report line: <key> <reference row> <test row>, with

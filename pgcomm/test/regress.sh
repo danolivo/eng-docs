@@ -10,17 +10,22 @@
 # 3. Adds key tables (test/keytables.sql): for every column type in the
 #    database that can be a primary key, a table keyed by that type and
 #    filled with the distinct values the suite left in such columns.
-# 4. Picks every table pgcmp can handle (ordinary table with a primary key
-#    of any type) and compares each one with itself through two separate
-#    connections to the same database. Anything but "match" is a pgcmp bug.
-#    Single integer keys go through the merge strategy, the rest through
-#    hash blocks; the blocks are tiny (MEM, 4kB by default), so that every
-#    table with more than a few dozen rows is cut into many blocks and its
-#    key values travel as block bounds.
+# 4. Turns autovacuum off and analyses the whole database: the catalogs
+#    are compared too and must not change between the snapshots of the two
+#    sides, and every table gets a histogram for parallel mode.
+# 5. Takes every table with a primary key, of any type and any number of
+#    columns, catalogs included; only partitioned tables and inheritance
+#    parents are left out (not supported yet). Each one is compared with
+#    itself through two separate connections to the same database, once
+#    sequentially and once with -j JOBS (4 by default). Anything but
+#    "match" is a pgcmp bug. Single integer keys go through the merge
+#    strategy, the rest through hash blocks; the blocks are tiny (MEM, 4kB
+#    by default), so that every table with more than a few dozen rows is
+#    cut into many blocks and its key values travel as block bounds.
 #
 # Usage: test/regress.sh            (from the pgcomm directory)
 #        IMAGE=postgres:18 KEEP=1 test/regress.sh   (keep the container)
-#        JOBS=4 test/regress.sh     (parallel mode where a histogram exists)
+#        JOBS=8 test/regress.sh     (workers of the parallel pass)
 #        MEM=1MB test/regress.sh    (block size of the hash strategy)
 
 set -euo pipefail
@@ -96,25 +101,41 @@ DSN="host=127.0.0.1 port=$PORT user=postgres dbname=regression"
 echo "--- key tables of every type"
 psql -X -q -v ON_ERROR_STOP=1 -d "$DSN" -f "$HERE/test/keytables.sql" 2>&1 | sed 's/^.*NOTICE: *//'
 
-# Tables pgcmp accepts: ordinary tables (partitions included, partitioned
-# parents excluded) with a primary key.
+# The catalogs are compared too: nothing may write to them between the
+# snapshots of the two sides, and autovacuum would (pg_class.reltuples,
+# pg_statistic). The database-wide ANALYZE gives every table a histogram.
+echo "--- autovacuum off, ANALYZE"
+psql -X -q -v ON_ERROR_STOP=1 -d "$DSN" \
+	-c "ALTER SYSTEM SET autovacuum = off" -c "SELECT pg_reload_conf()" -c "ANALYZE" >/dev/null
+
+# Every table with a primary key, catalogs included. Partitioned tables
+# (relkind 'p') and inheritance parents are not supported yet; partitions
+# and inheritance children are ordinary tables and stay.
 psql -X -At -d "$DSN" >"$WORK/tables" <<'SQL'
 SELECT format('%I.%I', n.nspname, c.relname)
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
 WHERE c.relkind = 'r'
-  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-  AND n.nspname NOT LIKE 'pg\_toast%'
+  AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%'
+  AND NOT EXISTS (SELECT FROM pg_inherits h WHERE h.inhparent = c.oid)
 ORDER BY 1
 SQL
-TOTAL=$(psql -X -At -d "$DSN" -c "
-	SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-	WHERE c.relkind IN ('r', 'p')
-	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-	  AND n.nspname NOT LIKE 'pg\_toast%'")
-echo "--- $(wc -l <"$WORK/tables" | tr -d ' ') of $TOTAL tables are eligible"
+psql -X -At -F ' ' -d "$DSN" >"$WORK/counts" <<'SQL'
+SELECT count(*),
+       count(*) FILTER (WHERE n.nspname IN ('pg_catalog', 'information_schema')),
+       count(*) FILTER (WHERE c.relkind = 'p' OR EXISTS (SELECT FROM pg_inherits h WHERE h.inhparent = c.oid))
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%'
+SQL
+read -r WITHPK CATALOG SKIPPED <"$WORK/counts"
+echo "--- $WITHPK tables with a primary key ($CATALOG in the catalogs);" \
+	"$SKIPPED partitioned or inheritance parents left out; $(wc -l <"$WORK/tables" | tr -d ' ') to compare"
 
+PJOBS=${JOBS:-4}
 ok=0
 rows=0
 par=0
@@ -123,21 +144,24 @@ blocks=0
 keys=0
 failed=()
 while IFS= read -r t; do
-	if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -j "${JOBS:-1}" -mem "${MEM:-4kB}" -out "$WORK/out" >"$WORK/log" 2>&1; then
-		ok=$((ok + 1))
-		rows=$((rows + $(sed -n 's/.*reference: \([0-9]*\) rows.*/\1/p' "$WORK/log")))
-		blocks=$((blocks + $(sed -n 's/.*blocks: \([0-9]*\).*/\1/p' "$WORK/log" | grep . || echo 0)))
-		if grep -q 'parallel:' "$WORK/log"; then par=$((par + 1)); fi
-		if grep -q 'method: hash' "$WORK/log"; then hashed=$((hashed + 1)); fi
-		case $t in pgcmp_keys.*) keys=$((keys + 1)) ;; esac
-	else
-		failed+=("$t")
-		echo "FAIL $t"
-		sed 's/^/    /' "$WORK/log"
-		head -5 "$WORK/out" 2>/dev/null | sed 's/^/    /'
-	fi
+	for j in 1 "$PJOBS"; do
+		if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -j "$j" -mem "${MEM:-4kB}" -out "$WORK/out" >"$WORK/log" 2>&1; then
+			[ "$j" = 1 ] || { grep -q 'parallel:' "$WORK/log" && par=$((par + 1)); continue; }
+			ok=$((ok + 1))
+			rows=$((rows + $(sed -n 's/.*reference: \([0-9]*\) rows.*/\1/p' "$WORK/log")))
+			blocks=$((blocks + $(sed -n 's/.*blocks: \([0-9]*\).*/\1/p' "$WORK/log" | grep . || echo 0)))
+			if grep -q 'method: hash' "$WORK/log"; then hashed=$((hashed + 1)); fi
+			case $t in pgcmp_keys.*) keys=$((keys + 1)) ;; esac
+		else
+			failed+=("$t -j $j")
+			echo "FAIL $t -j $j"
+			sed 's/^/    /' "$WORK/log"
+			head -5 "$WORK/out" 2>/dev/null | cut -c1-300 | sed 's/^/    /'
+			break
+		fi
+	done
 done <"$WORK/tables"
 
-echo "--- $ok matched ($keys key tables; $rows rows; $hashed by hash blocks in $blocks blocks of ${MEM:-4kB};" \
-	"$par in parallel with -j ${JOBS:-1}), ${#failed[@]} failed"
+echo "--- $ok matched ($keys key tables; $rows rows; $hashed by hash blocks in $blocks blocks of ${MEM:-4kB});" \
+	"$par of them also in parallel with -j $PJOBS; ${#failed[@]} failed"
 [ ${#failed[@]} -eq 0 ]
