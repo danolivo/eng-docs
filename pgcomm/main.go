@@ -1,5 +1,7 @@
 // pgcmp compares one table on two PostgreSQL instances by streaming both
-// sides in primary-key order and merging the streams.
+// sides in primary-key order. A single integer key is merged on the client;
+// any other key is matched block by block through a hash table, with the
+// key ranges evaluated by the servers (see strategy.go).
 //
 // Row contents are compared as the server's own text representation of
 // ROW(col1, col2, ...) — i.e. what psql prints for a composite value — so
@@ -16,7 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,6 +42,42 @@ type options struct {
 	filter     string
 	out        string
 	jobs       int
+	blockMem   byteSize // hash strategy: memory for one block of reference rows
+}
+
+// byteSize is a -mem value: a number with an optional PostgreSQL-style
+// unit (kB, MB, GB, TB; powers of 1024). A bare number means MB.
+type byteSize int64
+
+var sizeUnits = []struct {
+	suffix string
+	shift  uint
+}{{"kB", 10}, {"MB", 20}, {"GB", 30}, {"TB", 40}}
+
+func (b *byteSize) Set(s string) error {
+	s = strings.TrimSpace(s)
+	shift := uint(20)
+	for _, u := range sizeUnits {
+		if strings.HasSuffix(s, u.suffix) {
+			s, shift = strings.TrimSpace(strings.TrimSuffix(s, u.suffix)), u.shift
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 1 || n > (1<<62)>>shift {
+		return fmt.Errorf("invalid size %q: want a positive number with an optional unit kB, MB, GB or TB", s)
+	}
+	*b = byteSize(n << shift)
+	return nil
+}
+
+func (b byteSize) String() string {
+	for i := len(sizeUnits) - 1; i >= 0; i-- {
+		if u := sizeUnits[i]; b >= 1<<u.shift && int64(b)%(1<<u.shift) == 0 {
+			return strconv.FormatInt(int64(b)>>u.shift, 10) + u.suffix
+		}
+	}
+	return strconv.FormatInt(int64(b), 10) + "B"
 }
 
 func main() {
@@ -58,7 +96,9 @@ func run() int {
 	flag.StringVar(&cols, "columns", "", "comma-separated columns to compare (default: columns present on both sides)")
 	flag.StringVar(&opt.filter, "filter", "", "WHERE expression applied on both sides")
 	flag.StringVar(&opt.out, "out", "pgcmp.out", "report file")
-	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram")
+	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram (integer keys only)")
+	opt.blockMem = 256 << 20
+	flag.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
 	flag.Parse()
 
 	// Parsing stops at the first non-flag argument; everything after it
@@ -70,7 +110,7 @@ func run() int {
 	}
 
 	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" || opt.jobs < 1 {
-		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-out <file>]")
+		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-out <file>]")
 		return exitError
 	}
 	for _, c := range strings.Split(cols, ",") {
@@ -139,48 +179,32 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	for i, c := range p.cols {
 		names[i] = c.name
 	}
-	log.Printf("key: %s (%s); columns: %s", p.pk, p.pkType, strings.Join(names, ", "))
+	keyTypes := make([]string, len(d1.pk))
+	for i, c := range d1.pk {
+		keyTypes[i] = c.typeName
+	}
+	log.Printf("key: (%s) [%s]; columns: %s", keyList(d1.pk), strings.Join(keyTypes, ", "), strings.Join(names, ", "))
 	if len(p.ignored) > 0 {
 		log.Printf("ignored (present on one side only): %s", strings.Join(p.ignored, ", "))
 	}
 
-	query := func(side int, r keyRange) string {
-		if side == 0 {
-			return buildQuery(d1.qualifiedName(), p, 0, opt.filter, r)
-		}
-		return buildQuery(d2.qualifiedName(), p, 1, opt.filter, r)
+	// 3. Choose how rows are matched by key. Everything below goes through
+	// the strategy and does not depend on the choice.
+	cmp, err := newStrategy(ctx, opt, ref, d1, d2, p)
+	if err != nil {
+		return stats{}, err
 	}
-	log.Printf("reference query: %s", query(0, keyRange{}))
-	if q2 := query(1, keyRange{}); q2 != query(0, keyRange{}) {
+	log.Printf("method: %s", cmp.name())
+	log.Printf("reference query: %s", cmp.query(0))
+	if q2 := cmp.query(1); q2 != cmp.query(0) {
 		log.Printf("test query: %s", q2)
-	}
-
-	// 3. Split the key space by the histogram of the reference side.
-	ranges := []keyRange{{}}
-	if opt.jobs > 1 {
-		bounds, err := ref.histogram(ctx, d1, p.pk)
-		if err != nil {
-			return stats{}, err
-		}
-		if len(bounds) < 2 {
-			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
-				d1.qualifiedName(), p.pk)
-		} else {
-			ranges = rangesFromBounds(bounds)
-			log.Printf("parallel: %d workers, %d key ranges from the histogram",
-				min(opt.jobs, len(ranges)), len(ranges))
-		}
 	}
 
 	// 4. Check that each side will read the rows in key order through the
 	// primary key index rather than scan and sort the table.
 	for i, s := range []*side{ref, tst} {
-		qs := make([]string, len(ranges))
-		for j, r := range ranges {
-			qs[j] = query(i, r)
-		}
 		table := []*description{d1, d2}[i].qualifiedName()
-		w, err := s.checkPlans(ctx, table, qs)
+		w, err := s.checkPlans(ctx, table, cmp.planQueries(i))
 		if err != nil {
 			return stats{}, err
 		}
@@ -197,13 +221,8 @@ func compare(ctx context.Context, opt *options) (stats, error) {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// 6. Compare: in the coordinator sessions, or in parallel workers.
-	var st stats
-	if len(ranges) == 1 {
-		st, err = runRange(ctx, ref, tst, query(0, ranges[0]), query(1, ranges[0]), w)
-	} else {
-		st, err = runParallel(ctx, opt, ref, tst, ranges, query, filepath.Dir(opt.out), w)
-	}
+	// 6. Compare.
+	st, err := cmp.run(ctx, ref, tst, w)
 	if err != nil {
 		return st, err
 	}

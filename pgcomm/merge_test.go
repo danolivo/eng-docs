@@ -72,7 +72,8 @@ func TestMergeOneSideEmpty(t *testing.T) {
 }
 
 func TestBuildQuery(t *testing.T) {
-	p := &plan{pk: "id", cols: []colPlan{
+	idKey := []keyCol{{colPlan: colPlan{name: "id"}}}
+	p := &plan{key: idKey, intKey: true, cols: []colPlan{
 		{name: "name"},
 		{name: "Odd Col", cast: [2]string{"", "numeric(12,3)"}},
 	}}
@@ -86,13 +87,13 @@ func TestBuildQuery(t *testing.T) {
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	got = buildQuery(`"public"."t"`, &plan{pk: "id"}, 0, "", keyRange{})
+	got = buildQuery(`"public"."t"`, &plan{key: idKey}, 0, "", keyRange{})
 	want = `SELECT "id", '()'::text FROM "public"."t" ORDER BY "id"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 	lo, hi := int64(-5), int64(100)
-	got = buildQuery(`"public"."t"`, &plan{pk: "id"}, 0, "x = 1", keyRange{&lo, &hi})
+	got = buildQuery(`"public"."t"`, &plan{key: idKey}, 0, "x = 1", keyRange{&lo, &hi})
 	want = `SELECT "id", '()'::text FROM "public"."t" WHERE (x = 1) AND "id" >= -5 AND "id" < 100 ORDER BY "id"`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
@@ -129,6 +130,9 @@ func fakeCommon(c1, c2 column) (string, error) {
 	if c1.typeName == "numeric(10,2)" && c2.typeName == "integer" {
 		return "numeric", nil
 	}
+	if c1.typeName == "integer" && c2.typeName == "bigint" {
+		return "bigint", nil
+	}
 	return "", errors.New("cannot be matched")
 }
 
@@ -157,7 +161,8 @@ func TestNegotiate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.pk != "id" || len(p.cols) != 2 || p.cols[0].name != "a" || p.cols[1].name != "b" {
+	if len(p.key) != 1 || p.key[0].name != "id" || !p.intKey ||
+		len(p.cols) != 2 || p.cols[0].name != "a" || p.cols[1].name != "b" {
 		t.Fatalf("unexpected plan: %+v", p)
 	}
 	if len(p.ignored) != 2 || p.ignored[0] != "reference.only_ref" || p.ignored[1] != "test.only_test" {
@@ -194,8 +199,46 @@ func TestNegotiate(t *testing.T) {
 		t.Fatal("expected a no-common-type error")
 	}
 
-	// Non-integer key is rejected.
+	tst.columns[1].typeName = "numeric(10,2)"
+
+	// A non-integer key goes to the hash strategy; the key column types
+	// without modifiers are kept for the range bounds.
+	ref.pk = []column{{name: "id", typeOID: 25, typeName: "text", baseType: "text"}}
+	tst.pk = []column{{name: "id", typeOID: 25, typeName: "text", baseType: "text"}}
+	p, err = negotiate(ref, tst, nil, fakeCommon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.intKey || len(p.key) != 1 || p.key[0].base != [2]string{"text", "text"} || p.key[0].cast != [2]string{} {
+		t.Fatalf("unexpected key: %+v", p.key)
+	}
+
+	// Composite key: also hash; an integer column of different widths is
+	// cast to the common type, and no key column is compared as data.
+	ref.pk = []column{ref.columns[0], ref.columns[1]}
+	tst.pk = []column{tst.columns[2], tst.columns[3]}
+	ref.pk[0].baseType, tst.pk[0].baseType = "integer", "bigint"
+	p, err = negotiate(ref, tst, nil, fakeCommon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.intKey || len(p.key) != 2 || p.key[0].cast != [2]string{"bigint", ""} ||
+		p.key[0].base != [2]string{"integer", "bigint"} || p.key[1].name != "a" {
+		t.Fatalf("unexpected key: %+v", p.key)
+	}
+	if len(p.cols) != 1 || p.cols[0].name != "b" {
+		t.Fatalf("key columns must not be compared as data: %+v", p.cols)
+	}
+
+	// Key columns must match by name and order.
+	tst.pk = []column{tst.columns[3], tst.columns[2]}
+	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
+		t.Fatal("expected a key mismatch error")
+	}
+
+	// A key column without a common type is an error.
 	ref.pk = []column{{name: "id", typeOID: 25, typeName: "text"}}
+	tst.pk = []column{tst.columns[2]}
 	if _, err := negotiate(ref, tst, nil, fakeCommon); err == nil {
 		t.Fatal("expected a key type error")
 	}

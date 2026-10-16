@@ -7,14 +7,21 @@
 #    builds the regression suite and runs `make installcheck`. Test
 #    failures do not matter: we only need the "regression" database the
 #    suite leaves behind.
-# 3. Picks every table pgcmp can handle (ordinary table, single-column
-#    int2/int4/int8 primary key) and compares each one with itself through
-#    two separate connections to the same database. Anything but "match"
-#    is a pgcmp bug.
+# 3. Adds key tables (test/keytables.sql): for every column type in the
+#    database that can be a primary key, a table keyed by that type and
+#    filled with the distinct values the suite left in such columns.
+# 4. Picks every table pgcmp can handle (ordinary table with a primary key
+#    of any type) and compares each one with itself through two separate
+#    connections to the same database. Anything but "match" is a pgcmp bug.
+#    Single integer keys go through the merge strategy, the rest through
+#    hash blocks; the blocks are tiny (MEM, 4kB by default), so that every
+#    table with more than a few dozen rows is cut into many blocks and its
+#    key values travel as block bounds.
 #
 # Usage: test/regress.sh            (from the pgcomm directory)
 #        IMAGE=postgres:18 KEEP=1 test/regress.sh   (keep the container)
 #        JOBS=4 test/regress.sh     (parallel mode where a histogram exists)
+#        MEM=1MB test/regress.sh    (block size of the hash strategy)
 
 set -euo pipefail
 
@@ -86,17 +93,17 @@ tail -3 "$WORK/installcheck.log"
 PORT=$(docker port "$NAME" 5432/tcp | head -1 | sed 's/.*://')
 DSN="host=127.0.0.1 port=$PORT user=postgres dbname=regression"
 
+echo "--- key tables of every type"
+psql -X -q -v ON_ERROR_STOP=1 -d "$DSN" -f "$HERE/test/keytables.sql" 2>&1 | sed 's/^.*NOTICE: *//'
+
 # Tables pgcmp accepts: ordinary tables (partitions included, partitioned
-# parents excluded) with a single-column integer primary key.
+# parents excluded) with a primary key.
 psql -X -At -d "$DSN" >"$WORK/tables" <<'SQL'
 SELECT format('%I.%I', n.nspname, c.relname)
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
-JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
 WHERE c.relkind = 'r'
-  AND i.indnkeyatts = 1
-  AND a.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype)
   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND n.nspname NOT LIKE 'pg\_toast%'
 ORDER BY 1
@@ -111,12 +118,18 @@ echo "--- $(wc -l <"$WORK/tables" | tr -d ' ') of $TOTAL tables are eligible"
 ok=0
 rows=0
 par=0
+hashed=0
+blocks=0
+keys=0
 failed=()
 while IFS= read -r t; do
-	if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -j "${JOBS:-1}" -out "$WORK/out" >"$WORK/log" 2>&1; then
+	if "$BIN" -dsn1 "$DSN" -dsn2 "$DSN" -table "$t" -j "${JOBS:-1}" -mem "${MEM:-4kB}" -out "$WORK/out" >"$WORK/log" 2>&1; then
 		ok=$((ok + 1))
 		rows=$((rows + $(sed -n 's/.*reference: \([0-9]*\) rows.*/\1/p' "$WORK/log")))
+		blocks=$((blocks + $(sed -n 's/.*blocks: \([0-9]*\).*/\1/p' "$WORK/log" | grep . || echo 0)))
 		if grep -q 'parallel:' "$WORK/log"; then par=$((par + 1)); fi
+		if grep -q 'method: hash' "$WORK/log"; then hashed=$((hashed + 1)); fi
+		case $t in pgcmp_keys.*) keys=$((keys + 1)) ;; esac
 	else
 		failed+=("$t")
 		echo "FAIL $t"
@@ -125,5 +138,6 @@ while IFS= read -r t; do
 	fi
 done <"$WORK/tables"
 
-echo "--- $ok matched ($rows rows; $par in parallel with -j ${JOBS:-1}), ${#failed[@]} failed"
+echo "--- $ok matched ($keys key tables; $rows rows; $hashed by hash blocks in $blocks blocks of ${MEM:-4kB};" \
+	"$par in parallel with -j ${JOBS:-1}), ${#failed[@]} failed"
 [ ${#failed[@]} -eq 0 ]

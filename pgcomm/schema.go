@@ -31,8 +31,9 @@ SET statement_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
 `
 
-// Integer types accepted as a primary key: int2, int4, int8. The key is
-// read into int64, so the two sides may use different integer widths.
+// Key types the merge strategy handles: int2, int4, int8. The key is read
+// into int64, so the two sides may use different integer widths. Any other
+// key goes to the hash-block strategy.
 var integerTypes = map[uint32]bool{21: true, 23: true, 20: true}
 
 type side struct {
@@ -97,6 +98,7 @@ type column struct {
 	name     string
 	typeOID  uint32
 	typeName string // format_type(atttypid, atttypmod), e.g. numeric(10,2)
+	baseType string // format_type(atttypid, NULL), e.g. numeric
 }
 
 // description is what one side knows about the table.
@@ -129,12 +131,31 @@ type colPlan struct {
 	cast [2]string
 }
 
+// keyCol is one primary key column. The colPlan part casts the column to
+// the common type where the key is compared as text. base[i] is the column
+// type on side i without its modifier: range bounds sent to that side as
+// parameters are cast to it, so that the condition compares in the
+// column's own type and can use the index.
+type keyCol struct {
+	colPlan
+	base [2]string
+}
+
 // plan is the negotiated result: which key and which columns are compared.
 type plan struct {
-	pk      string
-	pkType  string
+	key     []keyCol  // primary key columns, in index order
+	intKey  bool      // one int2/int4/int8 key column on both sides
 	cols    []colPlan // non-key columns, in reference-table order
 	ignored []string  // columns present on one side only (default column list)
+}
+
+func (p *plan) isKey(name string) bool {
+	for _, k := range p.key {
+		if k.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // commonTypeFunc returns the most general type of two column definitions,
@@ -215,7 +236,8 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 
 	rows, err := s.tx.Query(ctx, `
 		SELECT a.attname, a.atttypid,
-		       pg_catalog.format_type(a.atttypid, a.atttypmod)
+		       pg_catalog.format_type(a.atttypid, a.atttypmod),
+		       pg_catalog.format_type(a.atttypid, NULL)
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, d.oid)
@@ -224,7 +246,7 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	}
 	d.columns, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (column, error) {
 		var c column
-		err := r.Scan(&c.name, &c.typeOID, &c.typeName)
+		err := r.Scan(&c.name, &c.typeOID, &c.typeName, &c.baseType)
 		return c, err
 	})
 	if err != nil {
@@ -305,24 +327,36 @@ func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
 // With no explicit column list, exactly the columns present on both sides
 // are compared; a column present on one side only is ignored. A column
 // named explicitly must exist on both sides.
+//
+// The primary key may be of any type and have any number of columns, but
+// both sides must have the same key columns in the same order. A single
+// int2/int4/int8 column on both sides sets intKey: such a key is compared
+// as an integer and needs no casts.
 func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (*plan, error) {
 	for _, d := range []*description{d1, d2} {
-		switch {
-		case len(d.pk) == 0:
+		if len(d.pk) == 0 {
 			return nil, fmt.Errorf("%s: %s has no primary key", d.side, d.qualifiedName())
-		case len(d.pk) > 1:
-			return nil, fmt.Errorf("%s: %s has a composite primary key; only single-column integer keys are supported", d.side, d.qualifiedName())
-		case !integerTypes[d.pk[0].typeOID]:
-			return nil, fmt.Errorf("%s: primary key %s.%s is %s; only int2/int4/int8 keys are supported",
-				d.side, d.qualifiedName(), d.pk[0].name, d.pk[0].typeName)
 		}
 	}
-	pk1, pk2 := d1.pk[0], d2.pk[0]
-	if pk1.name != pk2.name {
-		return nil, fmt.Errorf("primary key column differs: %q (reference) vs %q (test)", pk1.name, pk2.name)
+	if keyList(d1.pk) != keyList(d2.pk) {
+		return nil, fmt.Errorf("primary key differs: (%s) (reference) vs (%s) (test)", keyList(d1.pk), keyList(d2.pk))
 	}
 
-	p := &plan{pk: pk1.name, pkType: pk1.typeName}
+	p := &plan{intKey: len(d1.pk) == 1 && integerTypes[d1.pk[0].typeOID] && integerTypes[d2.pk[0].typeOID]}
+	for i := range d1.pk {
+		k := keyCol{
+			colPlan: colPlan{name: d1.pk[i].name},
+			base:    [2]string{d1.pk[i].baseType, d2.pk[i].baseType},
+		}
+		if !p.intKey {
+			cp, err := castPlan(d1.pk[i], d2.pk[i], common)
+			if err != nil {
+				return nil, fmt.Errorf("primary key column %q: %w", k.name, err)
+			}
+			k.colPlan = cp
+		}
+		p.key = append(p.key, k)
+	}
 
 	if len(requested) == 0 {
 		for _, c := range d1.columns {
@@ -342,7 +376,7 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 	var problems []string
 	seen := map[string]bool{}
 	for _, name := range requested {
-		if seen[name] || name == p.pk {
+		if seen[name] || p.isKey(name) {
 			continue
 		}
 		seen[name] = true
@@ -360,20 +394,10 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 			continue
 		}
 
-		cp := colPlan{name: name}
-		if c1.typeName != c2.typeName {
-			target, err := common(c1, c2)
-			if err != nil {
-				problems = append(problems, fmt.Sprintf("column %q: no common type for %s (reference) and %s (test): %v",
-					name, c1.typeName, c2.typeName, err))
-				continue
-			}
-			if c1.typeName != target {
-				cp.cast[0] = target
-			}
-			if c2.typeName != target {
-				cp.cast[1] = target
-			}
+		cp, err := castPlan(c1, c2, common)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("column %q: %v", name, err))
+			continue
 		}
 		p.cols = append(p.cols, cp)
 	}
@@ -383,24 +407,66 @@ func negotiate(d1, d2 *description, requested []string, common commonTypeFunc) (
 	return p, nil
 }
 
-// buildQuery produces the SELECT for one side (0 = reference, 1 = test):
-// the key and the server-side text form of the row, ordered by the key.
-// The row is ROW(c1, c2, ...)::text, i.e. record_out, which is exactly what
-// psql shows for a composite value. Columns whose types differ between the
-// sides are cast to their common type first. r restricts the key range.
-func buildQuery(qualifiedTable string, p *plan, side int, filter string, r keyRange) string {
-	pk := pgx.Identifier{p.pk}.Sanitize()
-	rowExpr := "'()'::text"
-	if len(p.cols) > 0 {
-		exprs := make([]string, len(p.cols))
-		for i, c := range p.cols {
-			exprs[i] = pgx.Identifier{c.name}.Sanitize()
-			if t := c.cast[side]; t != "" {
-				exprs[i] += "::" + t
-			}
-		}
-		rowExpr = "ROW(" + strings.Join(exprs, ", ") + ")::text"
+// keyList returns the key column names, comma-separated, for messages and
+// for comparing the keys of the two sides.
+func keyList(pk []column) string {
+	names := make([]string, len(pk))
+	for i, c := range pk {
+		names[i] = c.name
 	}
+	return strings.Join(names, ", ")
+}
+
+// castPlan maps one column to the common type of its two definitions.
+func castPlan(c1, c2 column, common commonTypeFunc) (colPlan, error) {
+	cp := colPlan{name: c1.name}
+	if c1.typeName == c2.typeName {
+		return cp, nil
+	}
+	target, err := common(c1, c2)
+	if err != nil {
+		return cp, fmt.Errorf("no common type for %s (reference) and %s (test): %v", c1.typeName, c2.typeName, err)
+	}
+	if c1.typeName != target {
+		cp.cast[0] = target
+	}
+	if c2.typeName != target {
+		cp.cast[1] = target
+	}
+	return cp, nil
+}
+
+// expr returns the quoted column name, cast to the common type on side if
+// needed.
+func (c colPlan) expr(side int) string {
+	e := pgx.Identifier{c.name}.Sanitize()
+	if t := c.cast[side]; t != "" {
+		e += "::" + t
+	}
+	return e
+}
+
+// rowExpr is the server-side text form of the compared non-key columns on
+// one side: ROW(c1, c2, ...)::text, i.e. record_out, which is exactly what
+// psql shows for a composite value. Columns whose types differ between the
+// sides are cast to their common type first.
+func rowExpr(p *plan, side int) string {
+	if len(p.cols) == 0 {
+		return "'()'::text"
+	}
+	exprs := make([]string, len(p.cols))
+	for i, c := range p.cols {
+		exprs[i] = c.expr(side)
+	}
+	return "ROW(" + strings.Join(exprs, ", ") + ")::text"
+}
+
+// buildQuery produces the SELECT of the merge strategy for one side
+// (0 = reference, 1 = test): the integer key and the row text, ordered by
+// the key. r restricts the key range.
+func buildQuery(qualifiedTable string, p *plan, side int, filter string, r keyRange) string {
+	pk := pgx.Identifier{p.key[0].name}.Sanitize()
+	rowExpr := rowExpr(p, side)
 	var b strings.Builder
 	fmt.Fprintf(&b, "SELECT %s, %s FROM %s", pk, rowExpr, qualifiedTable)
 	var conds []string

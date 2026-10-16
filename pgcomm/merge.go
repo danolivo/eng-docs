@@ -1,35 +1,73 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"io"
+	"log"
+	"path/filepath"
 	"strconv"
 )
 
-type stats struct {
-	rows1, rows2 uint64 // rows read from the reference / test side
-	differ       uint64 // same key, different row text
-	onlyLeft     uint64 // key present only on the reference side
-	onlyRight    uint64 // key present only on the test side
+// mergeStrategy compares tables with a single integer key: both sides
+// stream in key order and the streams are merged on the client. With -j > 1
+// the key space is split by the histogram of the reference side.
+type mergeStrategy struct {
+	opt    *options
+	tables [2]string
+	p      *plan
+	ranges []keyRange
 }
 
-func (s stats) diffs() uint64 { return s.differ + s.onlyLeft + s.onlyRight }
+func newMergeStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *description, p *plan) (*mergeStrategy, error) {
+	m := &mergeStrategy{
+		opt:    opt,
+		tables: [2]string{d1.qualifiedName(), d2.qualifiedName()},
+		p:      p,
+		ranges: []keyRange{{}},
+	}
+	if opt.jobs > 1 {
+		pk := p.key[0].name
+		bounds, err := ref.histogram(ctx, d1, pk)
+		if err != nil {
+			return nil, err
+		}
+		if len(bounds) < 2 {
+			log.Printf("warning: no histogram for %s.%s on the reference side (run ANALYZE); running without parallelism",
+				d1.qualifiedName(), pk)
+		} else {
+			m.ranges = rangesFromBounds(bounds)
+			log.Printf("parallel: %d workers, %d key ranges from the histogram",
+				min(opt.jobs, len(m.ranges)), len(m.ranges))
+		}
+	}
+	return m, nil
+}
 
-func (s *stats) add(o stats) {
-	s.rows1 += o.rows1
-	s.rows2 += o.rows2
-	s.differ += o.differ
-	s.onlyLeft += o.onlyLeft
-	s.onlyRight += o.onlyRight
+func (m *mergeStrategy) name() string { return "merge by integer key" }
+
+func (m *mergeStrategy) rangeQuery(side int, r keyRange) string {
+	return buildQuery(m.tables[side], m.p, side, m.opt.filter, r)
+}
+
+func (m *mergeStrategy) query(side int) string { return m.rangeQuery(side, keyRange{}) }
+
+func (m *mergeStrategy) planQueries(side int) []string {
+	qs := make([]string, len(m.ranges))
+	for i, r := range m.ranges {
+		qs[i] = m.rangeQuery(side, r)
+	}
+	return qs
+}
+
+func (m *mergeStrategy) run(ctx context.Context, ref, tst *side, w io.Writer) (stats, error) {
+	if len(m.ranges) == 1 {
+		return runRange(ctx, ref, tst, m.rangeQuery(0, m.ranges[0]), m.rangeQuery(1, m.ranges[0]), w)
+	}
+	return runParallel(ctx, m.opt, ref, tst, m.ranges, m.rangeQuery, filepath.Dir(m.opt.out), w)
 }
 
 // merge consumes two key-ordered streams and writes one report line per
-// mismatch: <key> <reference row> <test row>, with NULL standing for a
-// row that is absent on one side. It returns when both channels are closed.
-//
-// A space is a safe separator: record_out double-quotes any field that
-// contains whitespace, so a row's text never has a bare space in it. A row
-// always starts with '(', so it cannot be confused with the NULL marker.
+// mismatch (see writeDiff). It returns when both channels are closed.
 func merge(in1, in2 <-chan row, w io.Writer) (stats, error) {
 	var st stats
 	recv1 := func() (row, bool) {
@@ -47,11 +85,7 @@ func merge(in1, in2 <-chan row, w io.Writer) (stats, error) {
 		return r, ok
 	}
 	report := func(key int64, left, right string) error {
-		_, err := fmt.Fprintf(w, "%s %s %s\n", strconv.FormatInt(key, 10), left, right)
-		if err != nil {
-			return fmt.Errorf("write report: %w", err)
-		}
-		return nil
+		return writeDiff(w, strconv.FormatInt(key, 10), left, right)
 	}
 
 	r1, ok1 := recv1()
