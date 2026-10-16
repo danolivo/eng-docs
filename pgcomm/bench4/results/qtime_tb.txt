@@ -1,0 +1,6 @@
+== n1.log
+pid 6366 15:37:27.432..15:37:31.077 stmts=   9 total=   3.62s max=  3.62s  SELECT "id", ROW("n", "pad")::text FROM "public"."t_b" ORDER BY "id"
+pid 6412 15:37:33.412..15:37:36.691 stmts= 118 total=   1.79s max=  0.08s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 
+== n2.log
+pid 6369 15:37:27.436..15:37:31.076 stmts=   9 total=   3.63s max=  3.63s  SELECT "id", ROW("n", "pad")::text FROM "public"."t_b" ORDER BY "id"
+pid 6413 15:37:33.414..15:37:36.699 stmts=  84 total=   1.76s max=  0.08s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 

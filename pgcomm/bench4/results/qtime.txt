@@ -1,0 +1,18 @@
+== n1.log
+pid 4692 15:27:59.525..15:27:59.525 stmts=   1 total=   0.22s max=  0.22s  SELECT pg_prewarm('t_nb', 'read'), pg_prewarm('t_nb_pkey', 'read')
+pid 4703 15:27:59.847..15:28:23.445 stmts=   9 total=  23.11s max= 23.10s  SELECT ROW("n", "id")::text, "n"::numeric::text, "id"::bigint::text, ROW("pad")::text FROM "public"."t_nb" ORDER BY "public"."t_nb"."n", "public"."t_nb"."id"
+pid 4762 15:28:25.627..15:28:25.627 stmts=   1 total=   0.10s max=  0.10s  SELECT pg_prewarm('t_nb', 'read'), pg_prewarm('t_nb_pkey', 'read')
+pid 4773 15:28:25.858..15:28:46.227 stmts= 184 total=  11.84s max=  0.30s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 
+pid 4859 15:28:48.572..15:28:48.572 stmts=   1 total=   0.22s max=  0.22s  SELECT pg_prewarm('t_bn', 'read'), pg_prewarm('t_bn_pkey', 'read')
+pid 4871 15:28:48.917..15:28:57.209 stmts=   9 total=   8.11s max=  8.10s  SELECT ROW("id", "n")::text, "id"::bigint::text, "n"::numeric::text, ROW("pad")::text FROM "public"."t_bn" ORDER BY "public"."t_bn"."id", "public"."t_bn"."n"
+pid 4925 15:28:59.361..15:28:59.361 stmts=   1 total=   0.11s max=  0.11s  SELECT pg_prewarm('t_bn', 'read'), pg_prewarm('t_bn_pkey', 'read')
+pid 4937 15:28:59.625..15:29:02.955 stmts= 117 total=   1.76s max=  0.08s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 
+== n2.log
+pid 4694 15:27:59.774..15:27:59.774 stmts=   1 total=   0.22s max=  0.22s  SELECT pg_prewarm('t_nb', 'read'), pg_prewarm('t_nb_pkey', 'read')
+pid 4706 15:27:59.850..15:28:23.445 stmts=  28 total=  11.64s max=  0.65s  SELECT ROW("n", "id")::text, ROW("pad")::text FROM "public"."t_nb" WHERE ("n", "id") > ($1::numeric, $2::bigint) AND ("n", "id") <= ($3::numeric, $4::bigint) OR
+pid 4764 15:28:25.745..15:28:25.745 stmts=   1 total=   0.10s max=  0.10s  SELECT pg_prewarm('t_nb', 'read'), pg_prewarm('t_nb_pkey', 'read')
+pid 4774 15:28:25.861..15:28:46.244 stmts= 119 total=  11.58s max=  0.32s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 
+pid 4862 15:28:48.826..15:28:48.826 stmts=   1 total=   0.24s max=  0.24s  SELECT pg_prewarm('t_bn', 'read'), pg_prewarm('t_bn_pkey', 'read')
+pid 4874 15:28:48.923..15:28:57.209 stmts=  28 total=   3.95s max=  0.21s  SELECT ROW("id", "n")::text, ROW("pad")::text FROM "public"."t_bn" WHERE ("id", "n") > ($1::bigint, $2::numeric) AND ("id", "n") <= ($3::bigint, $4::numeric) OR
+pid 4927 15:28:59.488..15:28:59.488 stmts=   1 total=   0.11s max=  0.11s  SELECT pg_prewarm('t_bn', 'read'), pg_prewarm('t_bn_pkey', 'read')
+pid 4936 15:28:59.622..15:29:02.963 stmts=  85 total=   1.74s max=  0.09s   SELECT encode(digest(COALESCE(string_agg(concat_ws('|', COALESCE(_tbl_."id"::text, ''), COALESCE(trim_scale(_tbl_."n")::text, ''), COALESCE(_tbl_."pad"::text, 

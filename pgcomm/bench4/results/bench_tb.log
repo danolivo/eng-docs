@@ -1,0 +1,11 @@
+2026-10-16 15:36:30 t_b r1 pgcmp rc=1 wall=   3.6s user=2.74s n1 heap hit/read=0/129033 idx=0/10932 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:36:36 t_b r1 ace   rc=0 wall=   3.3s user=0.08s n1 heap hit/read=1498/155737 idx=3266/13859 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:36:41 t_b r2 ace   rc=0 wall=   3.1s user=0.06s n1 heap hit/read=1153/148839 idx=2477/13139 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:36:47 t_b r2 pgcmp rc=1 wall=   3.6s user=2.85s n1 heap hit/read=0/129033 idx=0/10932 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:36:53 t_b r3 pgcmp rc=1 wall=   3.6s user=2.58s n1 heap hit/read=0/129033 idx=0/10932 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:36:59 t_b r3 ace   rc=0 wall=   3.1s user=0.05s n1 heap hit/read=1191/146420 idx=2375/12776 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:37:04 t_b r4 ace   rc=0 wall=   3.1s user=0.06s n1 heap hit/read=1696/148171 idx=2580/13076 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:37:10 t_b r4 pgcmp rc=1 wall=   3.7s user=2.84s n1 heap hit/read=0/129033 idx=0/10932 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:37:16 t_b r5 pgcmp rc=1 wall=   3.6s user=2.85s n1 heap hit/read=0/129033 idx=0/10932 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:37:22 t_b r5 ace   rc=0 wall=   3.3s user=0.08s n1 heap hit/read=1018/157531 idx=3322/14097 flagged=10 fp=0 deleted=3/3;inserted=4/4;updated=3/3
+2026-10-16 15:37:22 BENCH-DONE
