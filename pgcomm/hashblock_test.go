@@ -7,7 +7,7 @@ import (
 )
 
 func TestBlockMatch(t *testing.T) {
-	b := newBlock(1 << 20)
+	b := newBlock(1<<20, 0)
 	for _, r := range []refRow{{"(a)", "(1)"}, {"(b)", "(2)"}, {"(c)", "(3)"}, {"(d)", "(4)"}} {
 		if err := b.add(r.key, r.data); err != nil {
 			t.Fatal(err)
@@ -52,7 +52,7 @@ func TestBlockMatch(t *testing.T) {
 }
 
 func TestBlockFull(t *testing.T) {
-	b := newBlock(1)
+	b := newBlock(1, 0)
 	if b.full() {
 		t.Fatal("an empty block is never full")
 	}
@@ -60,12 +60,42 @@ func TestBlockFull(t *testing.T) {
 	if !b.full() {
 		t.Fatal("a block over its limit must be full")
 	}
-	b = newBlock(10 * rowOverhead)
+	b = newBlock(10*rowOverhead, 0)
 	for i := 0; !b.full(); i++ {
 		_ = b.add(string(rune('a'+i)), "")
 	}
 	if n := len(b.rows); n != 10 {
 		t.Fatalf("block took %d rows, want 10", n)
+	}
+}
+
+func TestBlockRows(t *testing.T) {
+	// The row limit closes the block before the memory limit ...
+	b := newBlock(1<<20, 3)
+	for i := 0; !b.full(); i++ {
+		_ = b.add(string(rune('a'+i)), "")
+	}
+	if n := len(b.rows); n != 3 {
+		t.Fatalf("block took %d rows, want 3", n)
+	}
+	// ... and survives reset.
+	b.reset()
+	if b.full() {
+		t.Fatal("a reset block is not full")
+	}
+	// The memory limit still applies when it is reached first.
+	b = newBlock(2*rowOverhead, 100)
+	for i := 0; !b.full(); i++ {
+		_ = b.add(string(rune('a'+i)), "")
+	}
+	if n := len(b.rows); n != 2 {
+		t.Fatalf("block took %d rows, want 2", n)
+	}
+	// One row per block is allowed.
+	b = newBlock(1<<20, 1)
+	_ = b.add("(k)", "")
+	if !b.full() {
+		t.Fatal("-rows 1: block must be full after one row")
 	}
 }
 

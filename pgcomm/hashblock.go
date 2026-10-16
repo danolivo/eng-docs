@@ -89,6 +89,9 @@ func newHashStrategy(ctx context.Context, opt *options, ref *side, d1, d2 *descr
 }
 
 func (h *hashStrategy) name() string {
+	if h.opt.blockRows > 0 {
+		return fmt.Sprintf("hash blocks of up to %d reference rows or %s, whichever is reached first", h.opt.blockRows, h.mem)
+	}
 	return fmt.Sprintf("hash blocks of up to %s of reference rows", h.mem)
 }
 
@@ -248,7 +251,7 @@ func (h *hashStrategy) compareRange(ctx context.Context, ref, tst *side, i int, 
 		return false, nil
 	}
 
-	b := newBlock(int64(h.mem))
+	b := newBlock(int64(h.mem), h.opt.blockRows)
 	var lo, hi []string // block bounds; nil lo: no lower bound
 	have, err := next() // vals holds a row not yet put into a block
 	if err != nil {
@@ -331,6 +334,7 @@ const rowOverhead = 96
 // of the test side (by key), then reference-only rows in key order.
 type block struct {
 	limit   int64 // bytes; a block always takes at least one row
+	maxRows int   // rows; 0 = no limit. Whichever limit is reached first closes the block
 	size    int64
 	rows    []refRow
 	matched []bool
@@ -339,8 +343,8 @@ type block struct {
 
 type refRow struct{ key, data string }
 
-func newBlock(limit int64) *block {
-	return &block{limit: limit, index: make(map[string]int)}
+func newBlock(limit int64, maxRows int) *block {
+	return &block{limit: limit, maxRows: maxRows, index: make(map[string]int, min(maxRows, 1<<16))}
 }
 
 func (b *block) reset() {
@@ -351,7 +355,9 @@ func (b *block) reset() {
 	clear(b.index)
 }
 
-func (b *block) full() bool { return len(b.rows) > 0 && b.size >= b.limit }
+func (b *block) full() bool {
+	return len(b.rows) > 0 && (b.size >= b.limit || (b.maxRows > 0 && len(b.rows) >= b.maxRows))
+}
 
 func (b *block) add(key, data string) error {
 	if _, dup := b.index[key]; dup {

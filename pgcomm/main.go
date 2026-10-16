@@ -43,6 +43,7 @@ type options struct {
 	out        string
 	jobs       int
 	blockMem   byteSize // hash strategy: memory for one block of reference rows
+	blockRows  int      // hash strategy: rows in one block; 0 = limited by blockMem only
 }
 
 // byteSize is a -mem value: a number with an optional PostgreSQL-style
@@ -99,6 +100,7 @@ func run() int {
 	flag.IntVar(&opt.jobs, "j", 1, "parallel workers; key ranges come from the reference histogram of the (first) key column")
 	opt.blockMem = 64 << 20
 	flag.Var(&opt.blockMem, "mem", "memory for one block of reference rows, e.g. 64MB or 512kB; a bare number is MB (keys other than a single integer column)")
+	flag.IntVar(&opt.blockRows, "rows", 0, "at most this many reference rows in one block, 0 = no limit; with -mem, whichever is reached first closes the block (keys other than a single integer column)")
 	flag.Parse()
 
 	// Parsing stops at the first non-flag argument; everything after it
@@ -109,8 +111,8 @@ func run() int {
 		return exitError
 	}
 
-	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" || opt.jobs < 1 {
-		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-out <file>]")
+	if opt.dsn1 == "" || opt.dsn2 == "" || opt.table == "" || opt.jobs < 1 || opt.blockRows < 0 {
+		fmt.Fprintln(os.Stderr, "usage: pgcmp -dsn1 <dsn> -dsn2 <dsn> -table <name> [-columns a,b,c] [-filter <expr>] [-j N] [-mem size] [-rows N] [-out <file>]")
 		return exitError
 	}
 	for _, c := range strings.Split(cols, ",") {
