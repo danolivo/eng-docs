@@ -88,11 +88,19 @@ func checkEncodings(ref, test string) error {
 	return nil
 }
 
+// column is one attribute as one server describes it.
+//
+// typeOID is meaningful only on the server it came from: built-in types
+// have the same OIDs everywhere, but user-defined types (enums, domains,
+// extension types) get theirs at creation time. Across servers a type is
+// identified by baseName, which is comparable because both sessions use
+// the same search_path.
 type column struct {
 	name     string
 	typeOID  uint32
 	typmod   int32
-	typeName string // format_type(atttypid, atttypmod)
+	typeName string // format_type(atttypid, atttypmod), e.g. numeric(10,2)
+	baseName string // format_type(atttypid, NULL), e.g. numeric
 }
 
 // description is what one side knows about the table.
@@ -211,7 +219,8 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 
 	rows, err := s.tx.Query(ctx, `
 		SELECT a.attname, a.atttypid, a.atttypmod,
-		       pg_catalog.format_type(a.atttypid, a.atttypmod)
+		       pg_catalog.format_type(a.atttypid, a.atttypmod),
+		       pg_catalog.format_type(a.atttypid, NULL)
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, d.oid)
@@ -220,7 +229,7 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 	}
 	d.columns, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (column, error) {
 		var c column
-		err := r.Scan(&c.name, &c.typeOID, &c.typmod, &c.typeName)
+		err := r.Scan(&c.name, &c.typeOID, &c.typmod, &c.typeName, &c.baseName)
 		return c, err
 	})
 	if err != nil {
@@ -264,8 +273,11 @@ func (s *side) describe(ctx context.Context, table string) (*description, error)
 // timestamptz); no such type means there is no unambiguous mapping. If the
 // winner is one side's own type, that side's full definition is kept, so
 // int4 vs numeric(10,2) compares as numeric(10,2) on both sides.
+//
+// s must be the side c1 came from: c1.typeOID is used on it, c2.typeOID is
+// never used. Types are matched across the servers by name only.
 func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
-	if c1.typeOID == c2.typeOID {
+	if c1.baseName == c2.baseName {
 		return s.formatType(ctx, c1.typeOID, widerTypmod(c1.typeOID, c1.typmod, c2.typmod))
 	}
 
@@ -275,10 +287,11 @@ func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var oid uint32
+	var base string
 	err = sp.QueryRow(ctx, fmt.Sprintf(
-		"SELECT pg_catalog.pg_typeof(x)::oid FROM (SELECT NULL::%s UNION ALL SELECT NULL::%s) s(x) LIMIT 1",
-		c1.typeName, c2.typeName)).Scan(&oid)
+		"SELECT pg_catalog.format_type(pg_catalog.pg_typeof(x)::oid, NULL) "+
+			"FROM (SELECT NULL::%s UNION ALL SELECT NULL::%s) s(x) LIMIT 1",
+		c1.typeName, c2.typeName)).Scan(&base)
 	if err != nil {
 		_ = sp.Rollback(ctx)
 		return "", err
@@ -287,13 +300,13 @@ func (s *side) commonType(ctx context.Context, c1, c2 column) (string, error) {
 		return "", err
 	}
 
-	switch oid {
-	case c1.typeOID:
+	switch base {
+	case c1.baseName:
 		return c1.typeName, nil
-	case c2.typeOID:
+	case c2.baseName:
 		return c2.typeName, nil
 	}
-	return s.formatType(ctx, oid, -1)
+	return base, nil
 }
 
 func (s *side) formatType(ctx context.Context, oid uint32, typmod int32) (string, error) {
