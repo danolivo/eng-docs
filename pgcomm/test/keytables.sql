@@ -3,9 +3,14 @@
 -- For every type used by a column anywhere in the regression database
 -- (catalogs included), creates
 --
---     pgcmp_keys."<typname>_<oid>" (k <type> PRIMARY KEY, src text)
+--     pgcmp_keys."<typname>_<hash>" (k <type> PRIMARY KEY, src text)
 --
--- and fills it with the distinct values of all columns of that type; src
+-- where <hash> is a prefix of md5(format_type(type)): the name tells types
+-- of the same name in different schemas apart and, unlike the type OID, is
+-- the same in every database, so the key tables of two databases built by
+-- separate runs of the suite pair up by name (the cross-database pass of
+-- test/regress.sh). It fills each table with the distinct values of all
+-- columns of that type; src
 -- names the column a value came from. A type without a default btree
 -- operator class cannot be a primary key and is skipped, as is a column
 -- whose values do not fit (bit(n) into bit, a value too long for a btree
@@ -51,7 +56,7 @@ BEGIN
 		  AND s.nspname NOT LIKE 'pg\_toast%' AND s.nspname NOT LIKE 'pg\_temp%'
 		ORDER BY 2, 1
 	LOOP
-		tbl := format('%s_%s', left(ty.typname, 50), ty.oid);
+		tbl := format('%s_%s', left(ty.typname, 50), left(md5(format_type(ty.oid, NULL)), 8));
 		BEGIN
 			EXECUTE format('CREATE TABLE pgcmp_keys.%I (k %s PRIMARY KEY, src text)',
 			               tbl, format_type(ty.oid, NULL));
