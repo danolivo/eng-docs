@@ -2,9 +2,11 @@
 #
 # Self-comparison on the PostgreSQL regression database.
 #
-# 1. Starts a container from the stock postgres image.
-# 2. Inside it, downloads the source of exactly the same server version,
-#    builds the regression suite and runs `make installcheck`. Test
+# 1. Derives a local image from the stock postgres image, once per server
+#    version and base image: build tools and the regression suite compiled
+#    from the source of exactly the same server version
+#    (pgcmp-regress:<version>-<base image id>; REBUILD=1 rebuilds it).
+# 2. Starts a container from it and runs `make installcheck`. Test
 #    failures do not matter: we only need the "regression" database the
 #    suite leaves behind.
 # 3. Adds key tables (test/keytables.sql): for every column type in the
@@ -62,48 +64,65 @@ trap cleanup EXIT
 echo "--- building pgcmp"
 (cd "$HERE" && go build -o "$BIN")
 
-echo "--- starting $IMAGE"
+# The server version decides which sources the suite is built from.
+docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/null
+VERSION=$(docker run --rm --entrypoint postgres "$IMAGE" -V | awk '{print $3}')
+echo "--- server version $VERSION ($IMAGE)"
+
+# Build tools, sources and the compiled suite live in a local image derived
+# from $IMAGE, built once and reused: installing the compilers is the
+# slowest step (several minutes), and nothing in it changes from run to
+# run. The tag carries the server version and the ID of the base image, so
+# a new release or a re-pulled $IMAGE gets a fresh one. REBUILD=1 forces a
+# rebuild. Old tags are not removed: `docker images pgcmp-regress`.
+BASEID=$(docker image inspect --format '{{.Id}}' "$IMAGE" | sed 's/^sha256://' | cut -c1-12)
+SUITE=pgcmp-regress:$VERSION-$BASEID
+SRC=/opt/postgresql-$VERSION
+if [ "${REBUILD:-0}" = 1 ] || ! docker image inspect "$SUITE" >/dev/null 2>&1; then
+	# The tarball is cached on the host: the download is the least reliable
+	# step, and the same version is needed run after run.
+	CACHE=${CACHE:-$HOME/.cache/pgcmp}
+	TARBALL=$CACHE/postgresql-$VERSION.tar.gz
+	if [ ! -s "$TARBALL" ]; then
+		echo "--- downloading postgresql-$VERSION.tar.gz"
+		mkdir -p "$CACHE"
+		curl -fsSL --retry 3 --connect-timeout 20 --speed-limit 10000 --speed-time 30 \
+			-o "$TARBALL.part" "https://ftp.postgresql.org/pub/source/v$VERSION/postgresql-$VERSION.tar.gz"
+		mv "$TARBALL.part" "$TARBALL"
+	fi
+	echo "--- building image $SUITE: build tools and the regression suite of postgresql-$VERSION"
+	mkdir "$WORK/image"
+	cp "$TARBALL" "$WORK/image/src.tar.gz"
+	# Since PG 17 the source tarball no longer ships generated files, so the
+	# build needs bison, flex and perl. pg_regress links against libpq.
+	docker build -q -t "$SUITE" -f - "$WORK/image" >/dev/null <<DOCKERFILE
+FROM $IMAGE
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \\
+        --no-install-recommends build-essential bison flex perl >/dev/null \\
+    && rm -rf /var/lib/apt/lists/*
+COPY src.tar.gz /opt/src.tar.gz
+RUN cd /opt && tar xzf src.tar.gz && rm src.tar.gz && chown -R postgres: $SRC
+USER postgres
+RUN cd $SRC \\
+    && ./configure -q --prefix=/usr/lib/postgresql/${VERSION%%.*} --without-icu --without-readline --without-zlib >/dev/null \\
+    && make -s -C src/interfaces/libpq >/dev/null \\
+    && make -s -C src/test/regress >/dev/null
+USER root
+DOCKERFILE
+else
+	echo "--- reusing image $SUITE"
+fi
+
+echo "--- starting $SUITE"
 docker run -d --name "$NAME" -p 127.0.0.1::5432 \
-	-e POSTGRES_HOST_AUTH_METHOD=trust "$IMAGE" >/dev/null
+	-e POSTGRES_HOST_AUTH_METHOD=trust "$SUITE" >/dev/null
 until docker exec "$NAME" pg_isready -q -U postgres 2>/dev/null; do sleep 1; done
 # The entrypoint restarts the server once after initialisation.
 sleep 3
 until docker exec "$NAME" pg_isready -q -U postgres 2>/dev/null; do sleep 1; done
 
-VERSION=$(docker exec "$NAME" postgres -V | awk '{print $3}')
-echo "--- server version $VERSION"
-
-echo "--- installing build tools"
-# Since PG 17 the source tarball no longer ships generated files, so the
-# build needs bison, flex and perl.
-docker exec -e DEBIAN_FRONTEND=noninteractive "$NAME" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential bison flex perl >/dev/null'
-
-# The tarball is cached on the host: the download is the slowest and the
-# least reliable step, and the same version is needed run after run.
-CACHE=${CACHE:-$HOME/.cache/pgcmp}
-TARBALL=$CACHE/postgresql-$VERSION.tar.gz
-if [ ! -s "$TARBALL" ]; then
-	echo "--- downloading postgresql-$VERSION.tar.gz"
-	mkdir -p "$CACHE"
-	curl -fsSL --retry 3 --connect-timeout 20 --speed-limit 10000 --speed-time 30 \
-		-o "$TARBALL.part" "https://ftp.postgresql.org/pub/source/v$VERSION/postgresql-$VERSION.tar.gz"
-	mv "$TARBALL.part" "$TARBALL"
-fi
-docker cp "$TARBALL" "$NAME:/tmp/src.tar.gz"
-docker exec "$NAME" chown postgres /tmp/src.tar.gz
-
-echo "--- building the regression suite from postgresql-$VERSION sources"
-docker exec -u postgres -w /tmp "$NAME" sh -c "
-	set -e
-	tar xzf src.tar.gz
-	cd postgresql-$VERSION
-	./configure -q --prefix=/usr/lib/postgresql/${VERSION%%.*} --without-icu --without-readline --without-zlib >/dev/null
-	make -s -C src/interfaces/libpq >/dev/null   # pg_regress links against it
-	make -s -C src/test/regress >/dev/null
-"
-
 echo "--- make installcheck (failures are expected and ignored)"
-docker exec -u postgres -w "/tmp/postgresql-$VERSION" \
+docker exec -u postgres -w "$SRC" \
 	-e PGHOST=/var/run/postgresql -e PGUSER=postgres "$NAME" \
 	make -s -C src/test/regress installcheck >"$WORK/installcheck.log" 2>&1 || true
 tail -3 "$WORK/installcheck.log"
@@ -202,7 +221,7 @@ psql -X -q -d "host=127.0.0.1 port=$PORT user=postgres dbname=postgres" \
 	-f "$HERE/test/oidshift.sql" 2>&1 | sed -n -e 's/^.*WARNING: *\(oidshift:\)/\1/p' -e '/ERROR/p'
 
 echo "--- make installcheck into $DB2 (failures are expected and ignored)"
-docker exec -u postgres -w "/tmp/postgresql-$VERSION" \
+docker exec -u postgres -w "$SRC" \
 	-e PGHOST=/var/run/postgresql -e PGUSER=postgres "$NAME" \
 	make -s -C src/test/regress installcheck EXTRA_REGRESS_OPTS="--dbname=$DB2" \
 	>"$WORK/installcheck2.log" 2>&1 || true
