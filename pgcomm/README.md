@@ -1,23 +1,23 @@
-# pgcmp — сравнение одной таблицы на двух инстансах PostgreSQL
+# pgcmp — comparing one table on two PostgreSQL instances
 
-Макет «прямолинейного» подхода из документа *Table Comparison — Do we need
-technology?*: два потока строк в порядке первичного ключа, без деревьев
-хэшей. Сериализация целиком на сервере: строка сравнивается как текст
-`ROW(c1, c2, …)` — ровно то, что показывает psql для составного значения.
+A mock-up of the "straightforward" approach from the document *Table Comparison — Do we need
+technology?*: two streams of rows in primary key order, with no hash
+trees. Serialization happens entirely on the server: a row is compared as the text
+`ROW(c1, c2, …)` — exactly what psql shows for a composite value.
 
-Способ сопоставления строк по ключу выбирается один раз, когда определён
-состав первичного ключа (`strategy.go`):
+The way rows are matched by key is chosen once, when the
+columns of the primary key are known (`strategy.go`):
 
-* **слияние** (`merge.go`) — ключ из одной колонки `int2`/`int4`/`int8`.
-  Обе стороны читаются потоком и сливаются на клиенте;
-* **хэш-блоки** (`hashblock.go`) — любой другой ключ: любого типа, из
-  любого числа колонок. Клиент никогда не решает, какой из двух ключей
-  меньше, — это делают серверы. Подробности ниже.
+* **merge** (`merge.go`) — a single-column key of type `int2`/`int4`/`int8`.
+  Both sides are read as streams and merged on the client;
+* **hash blocks** (`hashblock.go`) — any other key: of any type, with
+  any number of columns. The client never decides which of two keys
+  is smaller — the servers do that. Details below.
 
-Параллельный режим есть у обоих: диапазоны берутся из гистограммы
-(первой) колонки ключа.
+Both have a parallel mode: ranges are taken from the histogram of the
+(first) key column.
 
-## Сборка
+## Build
 
 ```sh
 go mod tidy
@@ -25,119 +25,119 @@ go build
 go test
 ```
 
-Регрессионная база на двух инстансах (нужен Docker; ~2 минуты, первый
-запуск — ~12 минут на сборку образа):
+Regression suite on two instances (needs Docker; ~2 minutes, the first
+run takes ~12 minutes to build the image):
 
 ```sh
-test/regress.sh        # IMAGE=postgres:18 по умолчанию, KEEP=1 — не удалять контейнеры,
-                       # JOBS=4 — воркеры параллельного прохода, MEM=4kB — размер блока,
-                       # SELF=0 — без самосравнения, CROSS=0 — без второго инстанса
+test/regress.sh        # IMAGE=postgres:18 by default, KEEP=1 — keep the containers,
+                       # JOBS=4 — workers for the parallel pass, MEM=4kB — block size,
+                       # SELF=0 — no self-comparison, CROSS=0 — no second instance
 ```
 
-Скрипт один раз собирает из стокового образа локальный образ
-`pgcmp-regress:<версия>-<id базового образа>`: средства сборки и
-регрессионный набор, скомпилированный из исходников той же версии
-(тарбол кэшируется в `~/.cache/pgcmp`). Дальше этот образ
-переиспользуется, пока не сменится версия сервера или сам базовый образ;
-`REBUILD=1` пересобирает его принудительно.
+The script builds a local image once from the stock image:
+`pgcmp-regress:<version>-<base image id>`. It contains build tools and the
+regression suite compiled from the sources of the same version
+(the tarball is cached in `~/.cache/pgcmp`). After that, this image is
+reused until the server version or the base image itself changes;
+`REBUILD=1` forces a rebuild.
 
-Из образа поднимаются два инстанса: опорный A и тестовый B. На B до
-прогона набора `test/oidshift.sql` создаёт и удаляет по объекту каждого
-вида, которому выдаётся OID: таблица, тип, enum, функция, оператор, класс
-операторов, метод доступа, приведение, правило, триггер, событийный
-триггер, язык, трансформ, объекты полнотекстового поиска, FDW, сервер,
-user mapping, публикация, подписка, расширение, большой объект, роль,
-табличное пространство, база и т. д. Свежие инстансы начинают с одного и
-того же OID, и без этого шага набор выдал бы на обоих почти одинаковые
-OID; со сдвигом OID, relfilenode, порядок значений `reg*` и чётность OID
-меток enum на двух сторонах не совпадают. Скрипт сам проверяет покрытие
-по каталогам: у каждого каталога `pg_catalog` с колонкой `oid` должна
-появиться новая строка (новая версия сервера с новым каталогом его
-остановит), а после удаления не должно остаться ни одной.
+Two instances are started from the image: the reference A and the test B. On B, before
+the suite runs, `test/oidshift.sql` creates and drops one object of each
+kind that is assigned an OID: table, type, enum, function, operator, operator
+class, access method, cast, rule, trigger, event
+trigger, language, transform, full-text search objects, FDW, server,
+user mapping, publication, subscription, extension, large object, role,
+tablespace, database, etc. Fresh instances start from the same
+OID, and without this step the suite would produce almost the same
+OIDs on both; with the OID shift, the relfilenodes, the order of `reg*` values and the parity of enum
+label OIDs do not match on the two sides. The script itself checks the coverage
+by catalog: every `pg_catalog` catalog with an `oid` column must
+get a new row (a new server version with a new catalog will
+stop the script), and none of them must be left after the drop.
 
-Затем на обоих одновременно идёт `make installcheck`, `test/keytables.sql`
-добавляет схему `pgcmp_keys`: по таблице на каждый тип колонки в базе,
-который может быть первичным ключом, с ключом этого типа и всеми
-различными значениями, которые набор тестов оставил в таких колонках
-(NaN, бесконечности, пустые диапазоны, странные строки…). Имена этих
-таблиц не зависят от OID типа (`<typname>_<md5(format_type)>`), поэтому
-таблицы двух инстансов сопоставляются по имени. Потом autovacuum
-выключается (между чтениями pgcmp и оракула никто не должен писать ни в
-данные, ни в каталоги, откуда собраны ключевые таблицы; уже запущенные
-воркеры скрипт дожидается),
-и `ANALYZE` всей базы даёт таблицам гистограммы.
+Then `make installcheck` runs on both at the same time, and `test/keytables.sql`
+adds the schema `pgcmp_keys`: one table for each column type in the database
+that can be a primary key, with a key of that type and all the
+distinct values that the test suite left in such columns
+(NaN, infinities, empty ranges, odd strings…). The names of these
+tables do not depend on the type OID (`<typname>_<md5(format_type)>`), so
+the tables of the two instances are matched by name. Then autovacuum
+is turned off (between the reads of pgcmp and the oracle nobody must write to the
+data or to the catalogs from which the key tables were built; the script waits for
+workers that are already running),
+and `ANALYZE` of the whole database gives the tables histograms.
 
-Сравнивается каждая таблица с первичным ключом любого типа и состава,
-кроме системных каталогов `pg_catalog`: между инстансами они различаются
-только OID и статистикой. Пропускаются также партиционированные таблицы и
-родители по наследованию. Блоки по
-`MEM=4kB`, чтобы ключи гарантированно ходили границами блоков. Каждая
-таблица — последовательно и с `-j JOBS`, в два прохода:
+Every table with a primary key of any type and any columns is compared,
+except the system catalogs in `pg_catalog`: between instances they differ
+only in OIDs and statistics. Partitioned tables and
+inheritance parents are also skipped. Blocks are
+`MEM=4kB`, so that keys are sure to cross block boundaries. Each
+table is compared sequentially and with `-j JOBS`, in two passes:
 
-1. **A сам с собой** через два соединения. Любой результат, кроме
-   `match`, — ошибка pgcmp.
-2. **A против B**, если у таблицы на B та же структура: те же колонки тех
-   же типов и тот же ключ. Инстансы, конечно, различаются — OID в
-   каталогах и везде, где они хранятся, случайные и временные данные
-   набора, порядок создания объектов в параллельных группах тестов.
-   Поэтому проверяется не `match`, а совпадение с независимым оракулом:
-   скрипт читает таблицу целиком с обеих сторон через `psql` с теми же
-   настройками сеанса, что у pgcmp, соединяет строки по тексту ключа на
-   клиенте (`awk`) и строит отчёт, который pgcmp должен был написать.
-   Отчёт pgcmp и оракула сравниваются как отсортированные наборы строк,
-   код возврата — 0 или 1 по оракулу.
+1. **A against itself** over two connections. Any result other than
+   `match` is a pgcmp error.
+2. **A against B**, if the table on B has the same structure: the same columns of the
+   same types and the same key. The instances do, of course, differ — OIDs in
+   the catalogs and everywhere they are stored, random and temporary data from
+   the suite, the order in which objects are created in parallel test groups.
+   So the check is not for `match` but for agreement with an independent oracle:
+   the script reads the whole table from both sides through `psql` with the same
+   session settings as pgcmp, joins rows by key text on the
+   client (`awk`) and builds the report that pgcmp should have written.
+   The pgcmp and oracle reports are compared as sorted sets of lines,
+   and the exit code is 0 or 1 according to the oracle.
 
-   Таблицы, содержимое которых от прогона к прогону законно разное,
-   в этот проход не берутся (список `CROSS_SKIP` в скрипте, самосравнение
-   их сохраняет): `gtest20a` (`random()`), ключевые таблицы времени
-   (`'now'` из `type_sanity`), `text` (имена TOAST-таблиц с OID из
-   `event_trigger`), а также ключевые таблицы, набранные из каталогов:
-   `oid`, `name`, `oidvector`, `int4`, `float4` и др. — OID, `relpages`,
-   `reltuples` и статистика.
+   Tables whose contents legitimately differ from run to run
+   are left out of this pass (the `CROSS_SKIP` list in the script; self-comparison
+   keeps them): `gtest20a` (`random()`), the time key tables
+   (`'now'` from `type_sanity`), `text` (names of TOAST tables with OIDs from
+   `event_trigger`), and also the key tables filled from the catalogs:
+   `oid`, `name`, `oidvector`, `int4`, `float4` and others — OIDs, `relpages`,
+   `reltuples` and statistics.
 
-Таблицы с ключом из колонок `reg*` (например, `pgcmp_keys.reg*`) упорядочены по OID, а OID на двух инстансах разные — такое
-сравнение не поддерживается (см. «Чего нет»). Их расхождения с оракулом
-печатаются отдельной строкой `known:` и тест не валят.
+Tables with a key made of `reg*` columns (for example, `pgcmp_keys.reg*`) are ordered by OID, and the OIDs on the two instances differ — such a
+comparison is not supported (see "Not supported (yet)"). Their differences from the oracle
+are printed on a separate `known:` line and do not fail the test.
 
-Проверка параллельного режима на двух локальных кластерах (нужны `initdb`,
-`pg_ctl`, `psql` в `PATH`):
+Checking the parallel mode on two local clusters (needs `initdb`,
+`pg_ctl`, `psql` in `PATH`):
 
 ```sh
-test/parallel.sh       # ROWS=2000000 по умолчанию
+test/parallel.sh       # ROWS=2000000 by default
 ```
 
-Отчёт `-j 4` должен побайтово совпасть с отчётом `-j 1`; расхождения
-подложены на границах бинов, рядом с ними и за пределами гистограммы.
+The `-j 4` report must match the `-j 1` report byte for byte; differences
+are planted on bin boundaries, next to them and outside the histogram.
 
-Согласование пользовательских типов (enum, domain), у которых OID на двух
-серверах различаются (там же, локальные кластеры):
+Matching user-defined types (enum, domain) whose OIDs differ on the two
+servers (same setup, local clusters):
 
 ```sh
 test/types.sh
 ```
 
-Типы сопоставляются между серверами только по имени (`format_type`);
-OID используется лишь на том сервере, с которого он получен.
+Types are matched between servers only by name (`format_type`);
+an OID is used only on the server it came from.
 
-Хэш-блоки (там же, локальные кластеры):
+Hash blocks (same setup, local clusters):
 
 ```sh
-test/keys.sh           # ROWS=200000 по умолчанию
+test/keys.sh           # ROWS=200000 by default
 ```
 
-Ключи `text` (с пробелами, кавычками, запятыми), составной
-`(int, text)` против `(bigint, varchar)`, `uuid`, `timestamptz` с
-`±infinity`, `numeric` с `NaN`, составной с enum, у которого OID на
-сторонах разные, `char(n)`, `bit(n)`, составной с повтором в гистограмме
-первой колонки, таблица из одного ключа, перекос, пустые стороны. На
-тестовой стороне подложены 3 изменения, 3 удаления и 4 вставки, в том
-числе ниже минимума и выше максимума ключа; pgcmp должен найти ровно их
-с `-mem 1` (десятки блоков), с одним большим блоком и с `-j 4`, причём
-строки отчётов должны совпасть. Партиционированные таблицы и родители по
-наследованию должны быть отвергнуты, а их партиции и потомки —
-сравниваться.
+Keys: `text` (with spaces, quotes, commas), a composite
+`(int, text)` against `(bigint, varchar)`, `uuid`, `timestamptz` with
+`±infinity`, `numeric` with `NaN`, a composite with an enum whose OID differs on the
+two sides, `char(n)`, `bit(n)`, a composite with a repeated value in the histogram of the
+first column, a table that consists of the key only, skew, empty sides. On the
+test side, 3 updates, 3 deletes and 4 inserts are planted, including
+some below the minimum and above the maximum key; pgcmp must find exactly these
+with `-mem 1` (dozens of blocks), with one large block and with `-j 4`, and the
+report lines must match. Partitioned tables and inheritance
+parents must be rejected, while their partitions and children must
+be compared.
 
-## Запуск
+## Usage
 
 ```sh
 ./pgcmp -dsn1 'host=n1 dbname=db user=u' \
@@ -151,193 +151,193 @@ test/keys.sh           # ROWS=200000 по умолчанию
         [-out orders.diff]
 ```
 
-* `-dsn1` — опорная (reference) сторона, `-dsn2` — тестируемая.
-* `-table` — имя, при необходимости со схемой. Без схемы ищется в `public`
-  на обеих сторонах.
-* `-columns` — какие колонки сравнивать. По умолчанию — ровно те, что есть
-  на обеих сторонах; колонки, которые есть только на одной стороне,
-  игнорируются (их список печатается в лог). Явно названная колонка
-  обязана быть на обеих сторонах. Колонки первичного ключа из списка
-  выбрасываются.
-* `-filter` — выражение `WHERE`, подставляется как есть на обе стороны.
-* `-j` — число параллельных воркеров (по умолчанию 1). Каждый воркер —
-  пара соединений, поэтому на каждом сервере нужно `j + 1` соединений.
-* `-mem` — память на один блок строк опорной стороны (по умолчанию
-  `64MB`), только для хэш-блоков. Единицы как в PostgreSQL: `kB`, `MB`,
-  `GB`, `TB` (степени 1024); число без единицы — мегабайты. Это оценка по
-  длинам строк плюс накладные расходы на строку; RSS процесса из-за запаса
-  сборщика мусора Go бывает примерно вдвое больше. В параллельном режиме
-  блок у каждого воркера свой, всего до `j × mem`.
-* `-rows` — не больше стольких строк опорной стороны в одном блоке (по
-  умолчанию 0 — без ограничения), только для хэш-блоков. Вместе с `-mem`
-  блок закрывает тот предел, который достигнут раньше. Маленький блок
-  даёт сторонам работать одновременно: пока тестовая сторона отдаёт
-  диапазон текущего блока, опорный бэкенд пишет следующий блок в буферы
-  сокета, и если блок в них помещается, он уже прочитан к тому моменту,
-  когда клиент к нему вернётся. Цена — запрос к тестовой стороне на
-  каждый блок. Замер — `bench4/REPORT.md`.
+* `-dsn1` — the reference side, `-dsn2` — the test side.
+* `-table` — the name, with a schema if needed. Without a schema, it is looked up in `public`
+  on both sides.
+* `-columns` — which columns to compare. By default — exactly those that exist
+  on both sides; columns that exist on only one side are
+  ignored (their list is printed to the log). A column named explicitly
+  must exist on both sides. Primary key columns are removed
+  from the list.
+* `-filter` — a `WHERE` expression, inserted as is on both sides.
+* `-j` — the number of parallel workers (1 by default). Each worker is
+  a pair of connections, so each server needs `j + 1` connections.
+* `-mem` — memory for one block of reference-side rows (by default
+  `64MB`), for hash blocks only. Units as in PostgreSQL: `kB`, `MB`,
+  `GB`, `TB` (powers of 1024); a number without a unit means megabytes. This is an estimate based on
+  row lengths plus per-row overhead; the process RSS can be about twice as large
+  because of the Go garbage collector's headroom. In parallel mode
+  each worker has its own block, up to `j × mem` in total.
+* `-rows` — at most this many reference-side rows in one block (by
+  default 0 — no limit), for hash blocks only. Together with `-mem`,
+  a block is closed at whichever limit is reached first. A small block
+  lets the sides work at the same time: while the test side returns the
+  range of the current block, the reference backend writes the next block into the
+  socket buffers, and if the block fits in them, it has already been read by the time
+  the client returns to it. The cost is a query to the test side for
+  each block.
 
-## Хэш-блоки
+## Hash blocks
 
-1. Опорная сторона читается **одним** запросом в порядке ключа:
+1. The reference side is read with **one** query in key order:
    `SELECT ROW(k1, k2)::text, k1::T1::text, k2::T2::text, ROW(c…)::text … ORDER BY t.k1, t.k2`.
-   Строки складываются в хэш-таблицу по тексту ключа, пока блок не
-   достигнет `-mem`. Текстовые значения колонок ключа последней взятой
-   строки — верхняя граница блока.
-2. Тестовой стороне уходит тот же диапазон:
+   Rows are put into a hash table by key text until the block
+   reaches `-mem`. The text values of the key columns of the last row taken
+   are the upper bound of the block.
+2. The same range is sent to the test side:
    `… WHERE (k1, k2) > ($1::T1, $2::T2) AND (k1, k2) <= ($3::T1, $4::T2) ORDER BY …`.
-   Границы передаются текстовыми параметрами и приводятся к типам колонок
-   тестовой стороны без модификатора, так что сравнение идёт в типе
-   колонки и по индексу (сравнение строк `(a, b) > (…)` btree-индекс
-   обслуживает напрямую). Тип без модификатора — это
-   `format_type(oid, -1)`, а не `(oid, NULL)`: во втором случае `bpchar` и
-   `bit` выводятся как `character` и `bit`, то есть `char(1)` и `bit(1)`, и
-   явное приведение молча обрезает границу. Каждая строка ищется в блоке и сразу уходит в
-   отчёт; строки тестовой стороны не хранятся, поэтому память ограничена
-   одним блоком при любом перекосе.
-3. Строки блока, которым не нашлось пары, есть только на опорной стороне.
+   The bounds are passed as text parameters and cast to the column types of the
+   test side without a modifier, so the comparison is done in the column
+   type and uses the index (a btree index serves the row comparison
+   `(a, b) > (…)` directly). The type without a modifier is
+   `format_type(oid, -1)`, not `(oid, NULL)`: in the second case `bpchar` and
+   `bit` are printed as `character` and `bit`, that is, `char(1)` and `bit(1)`, and
+   an explicit cast silently truncates the bound. Each row is looked up in the block and goes straight to
+   the report; test-side rows are not stored, so memory is limited to
+   one block whatever the skew.
+3. Block rows that found no match exist only on the reference side.
 
-У первого блока нет нижней границы, у последнего — верхней: всё, что на
-тестовой стороне ниже минимума или выше максимума опорной, тоже попадает
-в сравнение. Запрос опорной стороны между блоками не закрывается: клиент
-просто перестаёт его читать, сокет заполняется, бэкенд ждёт. Ни курсора
-(`DECLARE CURSOR` планируется с `cursor_tuple_fraction`), ни лишних
-round trip-ов, ни повторных спусков по индексу.
+The first block has no lower bound, and the last one has no upper bound: everything on the
+test side below the minimum or above the maximum of the reference side is also included
+in the comparison. The reference-side query is not closed between blocks: the client
+simply stops reading it, the socket fills up, and the backend waits. No cursor
+(`DECLARE CURSOR` is planned with `cursor_tuple_fraction`), no extra
+round trips, no repeated index descents.
 
-Ключи сопоставляются по тексту `ROW(k1, k2, …)::text`, с приведением к
-общему типу там, где типы колонок ключа на сторонах различаются. Порядок
-задают серверы; предполагается, что он на обеих сторонах одинаков (разный
-collation ключа выдаёт себя последовательным сканированием на проверке
-планов).
+Keys are matched by the text `ROW(k1, k2, …)::text`, with a cast to a
+common type where the types of the key columns differ between the sides. The order
+is set by the servers; it is assumed to be the same on both sides (a different
+collation of the key gives itself away with a sequential scan during the plan
+check).
 
-`regproc` и `regoper` печатают перегруженную функцию или оператор голым
-именем: у `pg_aggregate` два ключа выглядят как `avg`, и `avg` обратно не
-читается. Для таких колонок текст ключа и границы идут через
-`regprocedure` и `regoperator` (с типами аргументов); сама колонка, её
-порядок и индекс остаются прежними.
+`regproc` and `regoper` print an overloaded function or operator as a bare
+name: in `pg_aggregate` two keys look like `avg`, and `avg` cannot be read
+back. For such columns, the key text and the bounds go through
+`regprocedure` and `regoperator` (with argument types); the column itself, its
+order and its index stay the same.
 
-Порядок отчёта внутри блока: сначала расхождения и строки только тестовой
-стороны (в порядке ключа), затем строки только опорной (тоже в порядке
-ключа). Для одних и тех же данных отчёт детерминирован, но при другом
-`-mem` строки идут в другом порядке; глобально по ключу он не отсортирован.
+Report order within a block: first the differences and the rows that exist only on the test
+side (in key order), then the rows that exist only on the reference side (also in key
+order). For the same data the report is deterministic, but with a different
+`-mem` the lines come in a different order; globally it is not sorted by key.
 
-## Параллельный режим
+## Parallel mode
 
-Ключевое пространство режется по гистограмме первичного ключа опорной
-таблицы (`pg_stats.histogram_bounds`), у составного ключа — по гистограмме
-его первой колонки: один диапазон на бин, у первого открыта левая граница,
-у последнего — правая, так что строки за пределами устаревшей статистики
-не теряются. Диапазоны полуоткрытые (`lo <= k1 < hi`), без перекрытий и
-дыр.
+The key space is split by the histogram of the primary key of the reference
+table (`pg_stats.histogram_bounds`); for a composite key, by the histogram
+of its first column: one range per bin, the first one open on the left
+and the last one open on the right, so rows outside stale statistics
+are not lost. Ranges are half-open (`lo <= k1 < hi`), with no overlaps or
+gaps.
 
-* `histogram_bounds` имеет тип `anyarray`: его нельзя ни привести, ни
-  развернуть, ни взять элемент. Поэтому гистограмма разбирается через
-  текст: `histogram_bounds::text::<тип колонки>[]`. Для хэш-блоков границы
-  затем снова выводятся текстом и подставляются в запросы литералами
-  `'…'::<тип>` (так запросы диапазонов можно проверить `EXPLAIN` до
-  старта).
-* Первая колонка составного ключа не уникальна: значение, которое чаще
-  ширины бина, но не попало в список частых, повторяется в гистограмме
-  несколько раз. Повторы отбрасывает сервер (`b > lag(b)`), иначе каждый
-  дал бы пустой диапазон.
-* Тип, который не читает собственный текст (`regproc`), — предупреждение
-  и последовательный запуск.
-* Внутри диапазона хэш-блоки работают как обычно: у первого блока нижняя
-  граница — граница диапазона, у последнего верхняя — тоже.
+* `histogram_bounds` has type `anyarray`: it cannot be cast,
+  unnested or subscripted. So the histogram is parsed through
+  text: `histogram_bounds::text::<column type>[]`. For hash blocks, the bounds
+  are then printed as text again and put into the queries as literals
+  `'…'::<type>` (this way the range queries can be checked with `EXPLAIN` before
+  the start).
+* The first column of a composite key is not unique: a value that occurs more often
+  than the bin width but is not in the most common values list appears in the histogram
+  several times. The server discards the repeats (`b > lag(b)`); otherwise each
+  would give an empty range.
+* A type that cannot read its own text (`regproc`) gives a warning
+  and a sequential run.
+* Within a range, hash blocks work as usual: the lower bound of the first block
+  is the range bound, and so is the upper bound of the last one.
 
-* Обе стороны экспортируют снапшот транзакции координатора
-  (`pg_export_snapshot()`), все воркеры его импортируют — видимость внутри
-  каждой стороны одна и та же.
-* Диапазоны раздаются воркерам через очередь; каждый пишет отчёт во
-  временный файл рядом с `-out`, в конце файлы склеиваются в порядке
-  диапазонов. Для слияния отчёт остаётся отсортированным по ключу и
-  совпадает с отчётом последовательного запуска; для хэш-блоков совпадает
-  набор строк, порядок — как при другом `-mem`.
-* Нет гистограммы (таблицу не анализировали) — предупреждение и
-  последовательный запуск.
-* Сервер отказал в соединении из-за `max_connections` — предупреждение,
-  работа продолжается с теми воркерами, что успели подключиться.
+* Both sides export the snapshot of the coordinator transaction
+  (`pg_export_snapshot()`), and all workers import it — visibility within
+  each side is the same.
+* Ranges are handed to workers through a queue; each one writes its report to a
+  temporary file next to `-out`, and at the end the files are concatenated in range
+  order. For merge, the report stays sorted by key and
+  matches the report of a sequential run; for hash blocks the
+  set of lines matches, and the order is as with a different `-mem`.
+* No histogram (the table has not been analyzed) — a warning and
+  a sequential run.
+* The server refused a connection because of `max_connections` — a warning,
+  and the work continues with the workers that managed to connect.
 
-## Что делает
+## What it does
 
-1. Подключается к обеим сторонам, выставляет одинаковые настройки сессии:
+1. Connects to both sides and sets the same session settings:
    `search_path = public`, `TimeZone`, `DateStyle`, `IntervalStyle`,
    `bytea_output`, `extra_float_digits`, `lc_monetary`,
-   `quote_all_identifiers`, `client_encoding`. Открывает
-   `REPEATABLE READ READ ONLY` транзакцию — каталог и данные читаются из
-   одного снапшота, а его потом можно экспортировать для параллельных
-   воркеров. Кодировка `SQL_ASCII` допускается только на обеих сторонах
-   сразу: такой сервер не перекодирует текст и отдаёт сырые байты, а
-   любой другой перекодирует в UTF8. Если major-версии серверов разные,
-   печатается предупреждение: функции вывода иногда меняются между
-   версиями (например, float8 до и после PG 12), и такие расхождения
-   будут не в данных, а в серверах.
-2. Согласует структуру: с каждой стороны берёт колонки (`format_type`
-   с typmod и без) и первичный ключ.
-   * Таблица — обычная (`relkind = 'r'`) и не родитель по наследованию:
-     `SELECT` из родителя вернул бы и строки потомков. Партиционированные
-     таблицы и родители пока не поддерживаются; отдельная партиция или
-     потомок — обычная таблица.
-   * PK есть, и на обеих сторонах у него одни и те же колонки в том же
-     порядке. Одна колонка `int2`/`int4`/`int8` (ширина на сторонах может
-     различаться) — слияние, всё остальное — хэш-блоки.
-   * Если тип колонки на сторонах различается, общий тип целиком выбирает
-     опорный сервер — тот, что он сам дал бы `UNION` этих двух типов
-     (тип с модификатором берётся из описания подготовленного запроса).
-     Колонка приводится к нему на каждой стороне, где тип другой:
+   `quote_all_identifiers`, `client_encoding`. Opens a
+   `REPEATABLE READ READ ONLY` transaction — the catalog and the data are read from
+   one snapshot, which can later be exported for parallel
+   workers. The `SQL_ASCII` encoding is allowed only if both sides
+   use it: such a server does not convert text and returns raw bytes, while
+   any other one converts to UTF8. If the major versions of the servers differ,
+   a warning is printed: output functions sometimes change between
+   versions (for example, float8 before and after PG 12), and such differences
+   come from the servers, not from the data.
+2. Matches the structure: on each side, it gets the columns (`format_type`
+   with and without typmod) and the primary key.
+   * The table is a plain one (`relkind = 'r'`) and not an inheritance parent:
+     `SELECT` from a parent would also return the rows of its children. Partitioned
+     tables and parents are not supported yet; a single partition or
+     child is a plain table.
+   * There is a PK, and on both sides it has the same columns in the same
+     order. A single `int2`/`int4`/`int8` column (the width may differ between
+     the sides) — merge; everything else — hash blocks.
+   * If a column type differs between the sides, the common type is chosen entirely by
+     the reference server — the type it would give itself for a `UNION` of these two types
+     (the type with its modifier is taken from the description of a prepared statement).
+     The column is cast to it on each side where the type is different:
      - `int4` + `int8` → `bigint`, `timestamp` + `timestamptz` → `timestamptz`;
-     - разные модификаторы сервер отбрасывает: `numeric(10,2)` +
+     - the server drops differing modifiers: `numeric(10,2)` +
        `numeric(12,3)` → `numeric`, `varchar(5)` + `varchar(10)` → `varchar`;
-     - `UNION` не может сопоставить типы (`integer` + `text`) — ошибка.
+     - `UNION` cannot match the types (`integer` + `text`) — an error.
 
-     Такое приведение ничего не теряет — округлить или обрезать значение
-     оно не может, поэтому реальная разница не спрячется. Обратная сторона:
-     равные значения иногда печатаются по-разному (`numeric` хранит
-     масштаб значения: `1.50` против `1.500`; `char(n)` хранит пробелы
-     дополнения) — это будет в отчёте как расхождение.
-3. Перед стартом каждый запрос (в параллельном режиме — запрос каждого
-   диапазона) проходит `EXPLAIN` на своей стороне. Если в плане есть
-   `Seq Scan` или `Parallel Seq Scan`, печатается предупреждение: таблица
-   будет прочитана целиком и отсортирована, а не пройдена по индексу
-   первичного ключа (в параллельном режиме — каждый такой диапазон читает
-   всю таблицу). Сортировка одного диапазона после bitmap-сканирования
-   индекса не считается: вся таблица при этом не читается.
-4. Слияние: на каждую сторону уходит запрос
-   `SELECT "pk", ROW("c1", "c2"::<общий тип>, …)::text FROM … [WHERE (…)] ORDER BY "pk"`.
-   Строки вычитываются потоково в двух горутинах и сливаются.
-   Хэш-блоки — см. выше.
-5. Отчёт пишется в `-out`. Либо одна строка `match`, либо по строке на
-   каждое расхождение:
+     Such a cast loses nothing — it cannot round or truncate a value,
+     so a real difference will not be hidden. The downside:
+     equal values are sometimes printed differently (`numeric` stores the
+     scale of the value: `1.50` against `1.500`; `char(n)` stores padding
+     spaces) — this will appear in the report as a difference.
+3. Before the start, each query (in parallel mode, the query of each
+   range) goes through `EXPLAIN` on its side. If the plan contains
+   `Seq Scan` or `Parallel Seq Scan`, a warning is printed: the table
+   will be read in full and sorted instead of being walked through the primary key
+   index (in parallel mode, each such range reads
+   the whole table). Sorting a single range after a bitmap index
+   scan does not count: the whole table is not read in that case.
+4. Merge: each side gets the query
+   `SELECT "pk", ROW("c1", "c2"::<common type>, …)::text FROM … [WHERE (…)] ORDER BY "pk"`.
+   Rows are streamed in two goroutines and merged.
+   Hash blocks — see above.
+5. The report is written to `-out`. It is either a single line `match`, or one line for
+   each difference:
 
    ```
-   <pk> <строка опорной таблицы> <строка тестируемой>
+   <pk> <reference table row> <test table row>
    ```
 
-   `<pk>` — целое при слиянии и текст `ROW(k1, k2, …)` при хэш-блоках,
-   например `(42,"a b")`. Отсутствующая строка обозначается `NULL`.
-   Разделитель — пробел: `record_out` берёт в кавычки любое поле с
-   пробельным символом, поэтому голого пробела внутри строки не бывает, а
-   сама строка всегда начинается с `(` и не путается с `NULL`.
+   `<pk>` is an integer for merge and the text `ROW(k1, k2, …)` for hash blocks,
+   for example `(42,"a b")`. A missing row is shown as `NULL`.
+   The separator is a space: `record_out` quotes any field with a
+   whitespace character, so there is never a bare space inside a row, and
+   the row itself always starts with `(` and cannot be confused with `NULL`.
 
-Коды возврата: `0` — совпали, `1` — есть расхождения, `2` — ошибка.
+Exit codes: `0` — match, `1` — there are differences, `2` — error.
 
-## Чего нет (пока)
+## Not supported (yet)
 
-* Ключи типов, которые не читают обратно собственный текст
-  (`pg_node_tree`, `pg_mcv_list`, `pg_dependencies`): первая же граница
-  блока даст ошибку на тестовой стороне. Если таблица помещается в один
-  блок, сравнение проходит.
-* Ключи `reg*`-типов упорядочены по OID. Между разными серверами OID
-  объектов обычно различаются, и такой ключ осмысленно сравнивать только
-  при совпадающих OID (например, сам с собой).
-* Проверка, что серверы упорядочивают ключ одинаково (разные версии
-  glibc/ICU): если порядок разойдётся, диапазоны тестовой стороны могут
-  перекрыться или оставить дыры. Дёшево ловится проверкой `$lo < $hi` на
-  тестовой стороне для каждого блока.
-* Партиционированные таблицы и таблицы с наследованием.
-* Приведение `timestamp` → `timestamptz` идёт в `TimeZone = UTC`. Если
-  подписчик получал значения в другой зоне, будут ложные расхождения.
-* Приведение к типу другой стороны может упасть на переполнении
-  (`int4` 1000 → `numeric(3,1)`) — тогда сравнение завершится ошибкой.
-* Экранирование перевода строки внутри значения: `record_out` берёт его
-  в кавычки, но не экранирует, и строка отчёта разрывается на две.
+* Keys of types that cannot read back their own text
+  (`pg_node_tree`, `pg_mcv_list`, `pg_dependencies`): the very first block
+  bound gives an error on the test side. If the table fits in one
+  block, the comparison succeeds.
+* Keys of `reg*` types are ordered by OID. Between different servers, object
+  OIDs usually differ, and such a key is meaningful to compare only
+  when the OIDs match (for example, a table against itself).
+* A check that the servers order the key in the same way (different versions of
+  glibc/ICU): if the order diverges, the test-side ranges may
+  overlap or leave gaps. This is cheap to catch with a `$lo < $hi` check on the
+  test side for each block.
+* Partitioned tables and tables with inheritance.
+* The `timestamp` → `timestamptz` cast is done with `TimeZone = UTC`. If the
+  subscriber received the values in a different time zone, there will be false differences.
+* A cast to the other side's type can fail on overflow
+  (`int4` 1000 → `numeric(3,1)`) — then the comparison ends with an error.
+* Escaping a newline inside a value: `record_out` quotes it
+  but does not escape it, and the report line breaks into two.
