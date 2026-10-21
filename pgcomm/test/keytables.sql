@@ -73,6 +73,10 @@ BEGIN
 			WHERE a.atttypid = ty.oid AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
 			  AND s.nspname NOT IN ('information_schema', 'pgcmp_keys')
 			  AND s.nspname NOT LIKE 'pg\_toast%' AND s.nspname NOT LIKE 'pg\_temp%'
+			-- A value found in several columns keeps the src of the first one:
+			-- the order must not depend on the physical order of pg_attribute,
+			-- or the same data gets a different src on another instance.
+			ORDER BY s.nspname, c.relname, a.attnum
 		LOOP
 			BEGIN
 				EXECUTE format(

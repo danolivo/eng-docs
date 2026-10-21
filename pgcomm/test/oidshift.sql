@@ -1,17 +1,17 @@
 -- Shift the OID counter for test/regress.sh.
 --
--- Run in the "postgres" database before the second `make installcheck`.
+-- Run in the "postgres" database of the test instance before
+-- `make installcheck` there.
 -- Creates one object of every kind that takes an OID, checks that every
 -- catalog with an oid column got a new row, then drops everything and
 -- checks that nothing is left behind.
 --
 -- The OID counter is cluster-wide: every database draws relation, type,
--- function and all other OIDs from it, and relfilenodes as well. Without
--- this step the second run of the suite would differ from the first only
--- by a constant offset in a few places; with it, objects of every kind are
--- allocated after a gap of a different size, so the OIDs of the two
--- databases interleave differently, and so do relfilenodes, the order of
--- reg* values and the parity of enum label OIDs.
+-- function and all other OIDs from it, and relfilenodes as well. Two fresh
+-- instances start from the same OID, and without this step the suite would
+-- allocate nearly the same OIDs on both; with it, everything on the test
+-- instance comes after a gap, so OIDs, relfilenodes, the order of reg*
+-- values and the parity of enum label OIDs no longer coincide.
 --
 -- Coverage is checked against the catalogs themselves: a new server
 -- version that adds a catalog with an oid column fails here until the
