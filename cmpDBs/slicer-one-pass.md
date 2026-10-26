@@ -22,7 +22,7 @@ WHERE rn % 1000 = 0;
 
 ## Issue with result delivery on client
 
-With simple query we not sure when 
+With simple query we not sure when the server sends data to us. It depends on buffers flushing mechanics. So, use cursors:
 
 ```sql
 DECLARE pgcmp_slice NO SCROLL CURSOR FOR
