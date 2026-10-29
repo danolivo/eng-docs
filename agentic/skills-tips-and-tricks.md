@@ -2,24 +2,43 @@
 
 Four categories: develop, review, design/observe, test. The source skill is given in brackets. Each line keeps the skill's own rule rather than a paraphrase of its spirit.
 
-## 1. Develop
+## Develop
 
-Sources: `pg-code-writer`, with habits shared by `pg-architect` and `kapila-architect`.
+### Actual developer's methods
 
+#### General
+
+- Before writing:
+-- Read the surrounding code for existing contexts, error style and naming; reuse before reinventing.
+-- Analyse potential invariants that will be introduced or changed by this code. Propose defensive assertions to control them.
+
+- "Look around": when you find one instance of a bug pattern, grep for the rest before declaring it fixed.
+
+#### Parochial (community specifics)
+
+- Split refactoring commits from feature commits; cleanup first, feature on top of a clean base.
 - Prefer MemoryContext cleanup over `pfree()`: create a child context, switch in, work, switch back, destroy. Any callee can `elog(ERROR)` and longjmp past your frees.
+- Three error tiers: `Assert()` for invariants, `elog(ERROR)` for "can't happen" bugs, `ereport(ERROR)` with an `errcode()` for user-visible errors.
+
+### Tests
+
+- Writing a regression test think about its output that might change because of a hardware/software platform. Also, relational relational database theory guarantees and its potential influence on the query result or explain.
+
+
+
+### Not-Yet-Processed ones
+
 - Never `palloc` between `START_CRIT_SECTION()` and `END_CRIT_SECTION()`. Use stack arrays or pre-allocated buffers; a failure there is a PANIC.
 - Guard size, count and offset arithmetic with `pg_add_s32_overflow()`, `pg_mul_s64_overflow()` and friends.
-- Three error tiers: `Assert()` for invariants, `elog(ERROR)` for "can't happen" bugs, `ereport(ERROR)` with an `errcode()` for user-visible errors.
 - Message style: lowercase first letter, no trailing period, name the object type, "unrecognised"/"invalid" rather than "unknown"/"bad"; syscall details go in `errdetail()`.
 - Comments explain danger, not the obvious: not `/* Demolish the house */` but `/* Caller must already have verified that the house is unoccupied */`.
-- "Look around": when you find one instance of a bug pattern, grep for the rest before declaring it fixed.
+
 - Switch on an enum: either no `default:` (so the compiler warns on new values) or `default: elog(ERROR, "unrecognised ...")`. Never `default: break`.
 - Use C99 designated initialisers for tables indexed by enum.
-- Split refactoring commits from feature commits; cleanup first, feature on top of a clean base.
+
 - Call the same helper at the same point in every code path. Consistency over cleverness.
 - Bundle related parameters into one ergonomic call instead of scattered function pairs (the `ShmemRequestStruct()` lesson).
 - Header hygiene: no transitive include propagation; keep a `*defs.h` with types only.
-- Before writing: read the surrounding code for existing contexts, error style and naming; reuse before reinventing.
 - Commit message: imperative summary under 64 chars, body explains why, "In passing, also fix…" for opportunistic cleanup, a `Discussion:` link.
 - Self-review in two voices (error paths/overflow vs consistency/ergonomics), then the defensive checklist, then propose patch decomposition.
 
@@ -60,39 +79,6 @@ Sources: `pg-code-review`, `tgl`, `andres-freund-reviewer`, `bcmills-concurrency
 - Ask what happens under high concurrency: locks held across I/O, buffer pins held too long, O(n²) where O(n) exists, cache invalidation, snapshot handling.
 - Code-clarity bar: can this be understood during a production incident at 3 am?
 - Flag issues that only appear under specific workloads or configurations.
-
-### Go concurrency (bcmills)
-
-- For every `go` statement answer in writing: who waits for it, what stops it, what happens if the caller returns first.
-- For every channel: sender, receiver, buffer size, who closes it. An unowned channel is a finding.
-- For every `context.Context`: first parameter, honoured (not merely passed), every derived cancel deferred.
-- `errgroup.Group{}` instead of `errgroup.WithContext` means nothing cancels.
-- `context.WithCancel` without `defer cancel()` leaks the timer and the parent's child list, not just the goroutine.
-- A `time.Sleep` in a test stands in for a missing synchronisation point. Fix the code, don't lengthen the sleep.
-- Check `go.mod`'s Go version before judging loop-variable capture.
-- Concurrency degree above the connection pool size is a deadlock waiting for a slow query.
-- Nested locks need a documented order, in a comment, next to the declarations.
-- Be willing to say the concurrency should be removed entirely.
-
-### Distributed data correctness (crdb)
-
-- Write the invariant above the function as a sentence that could be false, then check whether the code maintains it.
-- "Two nodes, two moments. What makes this a snapshot?" Reads outside an explicit consistency mechanism report noise as divergence.
-- Walk a crash between specific lines. A checkpoint written before the effect is durable is the classic silent gap.
-- Byte equality, Go `==` and SQL `=` are three different relations: collation, numeric scale, timestamptz, citext, NaN. Hash inputs need length prefixes or separators that cannot occur in the data.
-- Partial success across nodes is "unknown", never "consistent". If a type cannot be compared soundly, refuse loudly.
-- Serialization failures (`40001`) and deadlocks (`40P01`) are retryable; retries require idempotency, and the code must say what makes it idempotent.
-- Pools do not preserve session state (`search_path`, `statement_timeout`, GUCs).
-
-### API design (rsc)
-
-- First question: "what problem does this solve?" Demand the encountered case, not hypothetical flexibility.
-- "This can be added later. It cannot be removed later. So let's not add it yet."
-- Unexport anything nothing outside the package calls today (grep for it).
-- Behaviour change under the same signature is the worst break: callers compile and are wrong.
-- Write the doc comment first; if the semantics cannot be stated in one sentence (empty, nil, called twice, concurrently), the design is unfinished.
-- A 30-line helper beats a dependency almost every time; look at the dependency's own dependency tree.
-- Package names `util`, `common`, `helpers`, `misc` mean the author has not decided what the package is for.
 
 ## 3. Design / observe
 
