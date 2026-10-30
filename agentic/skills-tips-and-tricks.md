@@ -23,6 +23,7 @@ Four categories: develop, review, design/observe, test. The source skill is give
 ### Tests
 
 - Writing a regression test think about its output that might change because of a hardware/software platform. Also, relational relational database theory guarantees and its potential influence on the query result or explain.
+- Regression test should use current infrastructure as much as possible. Consider to use existing tables and other database objects to build up the test.
 
 
 
