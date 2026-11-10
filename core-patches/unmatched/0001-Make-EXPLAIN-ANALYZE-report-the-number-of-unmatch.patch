@@ -1,0 +1,199 @@
+From 2ae6b29d81ac3bfa0baca30e8b38d5134b32c950 Mon Sep 17 00:00:00 2001
+From: Andrei Lepikhov <lepihov@gmail.com>
+Date: Tue, 10 Nov 2026 14:22:32 +0100
+Subject: [PATCH v1 1/2] Make EXPLAIN ANALYZE report the number of unmatched
+ outer rows
+
+This provides information about the number of tuples on the outer side
+of the join that have not found a matching partner on the inner side.
+A large number of partnerless outer rows may point at a missed index or
+at a suboptimal join tree planning.
+
+ExecNestLoop(), ExecHashJoinImpl() and ExecMergeJoin() already track,
+per outer tuple, whether it has found a partner satisfying the join keys
+and the Join Filter (the *_MatchedOuter flag).  The flag used to be set
+on every matching pair. It is now set on the first one only, and that
+transition is counted in ntuples2, which join nodes did not use so far.
+show_join_outer_counts() derives the unmatched count as the outer
+child's row count minus the matched one.  InstrAggNode() already sums
+ntuples2, so parallel workers are covered.
+
+Like the actual row count, the value is averaged over loops and printed
+with two decimal places.  The divisor is the join node's loop count, as
+for "Rows Removed by Join Filter", because the line belongs to the join
+node; a loop that never reads the outer child, as a hash join with an
+empty hash table may do, simply contributes zero.  In text format the
+line is shown only when it is not zero, like "Rows Removed by ...", so
+the plans of most existing queries do not change; other formats always
+include it.  Hash Right Semi Join shows nothing: it skips already
+matched inner tuples before testing the join qual and so cannot tell
+matched outer rows.
+---
+ src/backend/commands/explain.c       | 54 ++++++++++++++++++++++++++++
+ src/backend/executor/nodeHashjoin.c  | 13 ++++++-
+ src/backend/executor/nodeMergejoin.c | 10 +++++-
+ src/backend/executor/nodeNestloop.c  | 10 +++++-
+ 4 files changed, 84 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index b8d1d0e..380257d 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -144,6 +144,7 @@ static void show_tidbitmap_info(BitmapHeapScanState *planstate,
+ 								ExplainState *es);
+ static void show_scan_io_usage(ScanState *planstate,
+ 							   ExplainState *es);
++static void show_join_outer_counts(PlanState *planstate, ExplainState *es);
+ static void show_instrumentation_count(const char *qlabel, int which,
+ 									   PlanState *planstate, ExplainState *es);
+ static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
+@@ -2177,6 +2178,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 			if (((NestLoop *) plan)->join.joinqual)
+ 				show_instrumentation_count("Rows Removed by Join Filter", 1,
+ 										   planstate, es);
++			show_join_outer_counts(planstate, es);
+ 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+ 			if (plan->qual)
+ 				show_instrumentation_count("Rows Removed by Filter", 2,
+@@ -2190,6 +2192,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 			if (((MergeJoin *) plan)->join.joinqual)
+ 				show_instrumentation_count("Rows Removed by Join Filter", 1,
+ 										   planstate, es);
++			show_join_outer_counts(planstate, es);
+ 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+ 			if (plan->qual)
+ 				show_instrumentation_count("Rows Removed by Filter", 2,
+@@ -2203,6 +2206,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 			if (((HashJoin *) plan)->join.joinqual)
+ 				show_instrumentation_count("Rows Removed by Join Filter", 1,
+ 										   planstate, es);
++			show_join_outer_counts(planstate, es);
+ 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+ 			if (plan->qual)
+ 				show_instrumentation_count("Rows Removed by Filter", 2,
+@@ -4300,6 +4304,56 @@ show_instrumentation_count(const char *qlabel, int which,
+ 	}
+ }
+ 
++/*
++ * show_join_outer_counts
++ *		Under EXPLAIN ANALYZE, show how many outer rows of a join node found
++ *		no partner.
++ *
++ * The executor counts matched outer rows in ntuples2; the unmatched count is
++ * the outer child's row count minus that.  Outer rows the join never read,
++ * e.g. after a Merge Join stops early, count as neither.
++ */
++static void
++show_join_outer_counts(PlanState *planstate, ExplainState *es)
++{
++	NodeInstrumentation *instr = planstate->instrument;
++	NodeInstrumentation *outer_instr;
++	double		nloops;
++	double		nmatched;
++	double		nunmatched;
++
++	if (!es->analyze || instr == NULL)
++		return;
++
++	/* ntuples2 is meaningless there, see ExecHashJoinImpl() */
++	if (((Join *) planstate->plan)->jointype == JOIN_RIGHT_SEMI)
++		return;
++
++	outer_instr = outerPlanState(planstate)->instrument;
++	Assert(outer_instr != NULL);
++
++	/*
++	 * ExplainNode() has not visited the outer child yet, so its current loop
++	 * may still be open.
++	 */
++	InstrEndLoop(outer_instr);
++
++	nloops = instr->nloops;
++	nmatched = instr->ntuples2;
++	Assert(nmatched <= outer_instr->ntuples);
++	nunmatched = outer_instr->ntuples - nmatched;
++
++	/* In text mode, suppress zero counts, like "Rows Removed by ..." */
++	if (nunmatched > 0 || es->format != EXPLAIN_FORMAT_TEXT)
++	{
++		if (nloops > 0)
++			ExplainPropertyFloat("Outer Rows Unmatched", NULL,
++								 nunmatched / nloops, 2, es);
++		else
++			ExplainPropertyFloat("Outer Rows Unmatched", NULL, 0.0, 0, es);
++	}
++}
++
+ /*
+  * Show extra information for a ForeignScan node.
+  */
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index 5df351a..f9950f5 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -595,7 +595,18 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 				 */
+ 				if (joinqual == NULL || ExecQual(joinqual, econtext))
+ 				{
+-					node->hj_MatchedOuter = true;
++					/*
++					 * ntuples2 counts outer tuples having at least one match,
++					 * so bump it only on the flag's false-to-true transition.
++					 * The count is meaningless in a right-semijoin: inner
++					 * tuples matched earlier are skipped above, before the
++					 * join qual is tested.
++					 */
++					if (!node->hj_MatchedOuter)
++					{
++						node->hj_MatchedOuter = true;
++						InstrCountTuples2(node, 1);
++					}
+ 
+ 					/*
+ 					 * This is really only needed if HJ_FILL_INNER(node) or if
+diff --git a/src/backend/executor/nodeMergejoin.c b/src/backend/executor/nodeMergejoin.c
+index 9e14ac7..7d29cf9 100644
+--- a/src/backend/executor/nodeMergejoin.c
++++ b/src/backend/executor/nodeMergejoin.c
+@@ -719,7 +719,15 @@ ExecMergeJoin(PlanState *pstate)
+ 
+ 				if (qualResult)
+ 				{
+-					node->mj_MatchedOuter = true;
++					/*
++					 * ntuples2 counts outer tuples with a match; count only
++					 * the first one.
++					 */
++					if (!node->mj_MatchedOuter)
++					{
++						node->mj_MatchedOuter = true;
++						InstrCountTuples2(node, 1);
++					}
+ 					node->mj_MatchedInner = true;
+ 
+ 					/* In an antijoin, we never return a matched tuple */
+diff --git a/src/backend/executor/nodeNestloop.c b/src/backend/executor/nodeNestloop.c
+index da48c9b..08afc5e 100644
+--- a/src/backend/executor/nodeNestloop.c
++++ b/src/backend/executor/nodeNestloop.c
+@@ -193,7 +193,15 @@ ExecNestLoop(PlanState *pstate)
+ 		 */
+ 		if (ExecQual(joinqual, econtext))
+ 		{
+-			node->nl_MatchedOuter = true;
++			/*
++			 * ntuples2 counts outer tuples having at least one match, so bump
++			 * it only on the flag's false-to-true transition.
++			 */
++			if (!node->nl_MatchedOuter)
++			{
++				node->nl_MatchedOuter = true;
++				InstrCountTuples2(node, 1);
++			}
+ 
+ 			/* In an antijoin, we never return a matched tuple */
+ 			if (node->js.jointype == JOIN_ANTI)
+-- 
+2.34.1
+

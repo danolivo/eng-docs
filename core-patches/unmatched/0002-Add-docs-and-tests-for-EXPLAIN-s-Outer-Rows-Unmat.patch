@@ -1,0 +1,1144 @@
+From f21f92e148c86d594018ef1b2ddea1db6e74df5a Mon Sep 17 00:00:00 2001
+From: Andrei Lepikhov <lepihov@gmail.com>
+Date: Tue, 10 Nov 2026 15:08:21 +0100
+Subject: [PATCH v1 2/2] Add docs and tests for EXPLAIN's "Outer Rows
+ Unmatched"
+
+Document the new line in perform.sgml and cover it with regression
+tests: all three join methods for INNER, LEFT, SEMI, ANTI and FULL
+joins, NULL keys, residual join quals, parameterized nested loops,
+rescans including an empty hash table, multi-batch and parallel hash
+joins, and the JSON format.
+
+Existing tests whose plans now show the line get updated expected
+output.  explain_parallel_append() in partition_prune.sql masks the
+value, which depends on the number of workers.
+---
+ doc/src/sgml/perform.sgml                     |  50 +++
+ src/test/isolation/expected/merge-update.out  |   6 +-
+ src/test/regress/expected/join.out            | 423 ++++++++++++++++++
+ src/test/regress/expected/join_hash.out       | 131 ++++++
+ src/test/regress/expected/memoize.out         |   3 +-
+ src/test/regress/expected/merge.out           |   6 +-
+ src/test/regress/expected/partition_prune.out |  22 +-
+ src/test/regress/sql/join.sql                 | 140 ++++++
+ src/test/regress/sql/join_hash.sql            |  85 ++++
+ src/test/regress/sql/partition_prune.sql      |   1 +
+ 10 files changed, 855 insertions(+), 12 deletions(-)
+
+diff --git a/doc/src/sgml/perform.sgml b/doc/src/sgml/perform.sgml
+index ea8da01..270645d 100644
+--- a/doc/src/sgml/perform.sgml
++++ b/doc/src/sgml/perform.sgml
+@@ -972,6 +972,56 @@ EXPLAIN ANALYZE SELECT * FROM tenk1 WHERE ten &lt; 7;
+     is rejected by the filter condition.
+    </para>
+ 
++   <para>
++    Nested Loop, Hash Join and Merge Join nodes can also show how many rows
++    of their outer input found no partner:
++
++<screen>
++EXPLAIN ANALYZE SELECT * FROM generate_series(1, 100) x JOIN generate_series(1, 10) y ON x = y;
++
++                                                           QUERY PLAN
++-------------------------------------------------------------------&zwsp;--------------------------------------------------------------
++ Hash Join  (cost=0.23..1.71 rows=10 width=8) (actual time=0.025..0.034 rows=10.00 loops=1)
++   Hash Cond: (x.x = y.y)
++   Outer Rows Unmatched: 90.00
++   -&gt;  Function Scan on generate_series x  (cost=0.00..1.00 rows=100 width=4) (actual time=0.011..0.014 rows=100.00 loops=1)
++   -&gt;  Hash  (cost=0.10..0.10 rows=10 width=4) (actual time=0.007..0.008 rows=10.00 loops=1)
++         Buckets: 1024  Batches: 1  Memory Usage: 9kB
++         -&gt;  Function Scan on generate_series y  (cost=0.00..0.10 rows=10 width=4) (actual time=0.003..0.004 rows=10.00 loops=1)
++ Planning Time: 0.102 ms
++ Execution Time: 0.065 ms
++</screen>
++
++    An outer row counts as matched if the join keys and the
++    <quote>Join Filter</quote> condition hold for at least one inner row;
++    the plain <quote>Filter</quote> of the join node does not matter.
++    The remaining outer rows are unmatched: here 90 of 100.  With an index
++    on the join key of the larger input, a parameterized nested loop could
++    have avoided reading them at all.  Unlike <quote>Rows Removed by Join
++    Filter</quote>, which depends on where the planner put the join keys,
++    the number of matched outer rows is the same whichever join method
++    executes the query, as long as the same input is on the outer side;
++    the number of unmatched ones differs only when a join method stops
++    reading its outer input early, see below.
++    In text format the line appears only when at least one outer row was
++    left unmatched; other output formats always show it.
++   </para>
++
++   <para>
++    Like the actual row count, the value is averaged over the loops of the
++    join node and shown with two decimal places, so multiplying it by the
++    join's <literal>loops</literal> gives back the total.
++    Only the outer rows the join node actually read are taken into account:
++    a merge join that stops early or a hash join with an empty hash table
++    does not read all of its outer input, and the rows it skipped are
++    counted neither as matched nor as unmatched.  If a <literal>LIMIT</literal>
++    above the join stops execution, the outer row being processed at that
++    moment may still be counted as unmatched because its search for a
++    partner was cut short; this adds at most one row per loop.  A hash join
++    executing a right semi join (<quote>Hash Right Semi Join</quote>)
++    cannot tell which outer rows were matched and does not show the value.
++   </para>
++
+    <para>
+     A case similar to filter conditions occurs with <quote>lossy</quote>
+     index scans.  For example, consider this search for polygons containing a
+diff --git a/src/test/isolation/expected/merge-update.out b/src/test/isolation/expected/merge-update.out
+index 821565b..438dda6 100644
+--- a/src/test/isolation/expected/merge-update.out
++++ b/src/test/isolation/expected/merge-update.out
+@@ -89,10 +89,11 @@ Merge on target t (actual rows=2.00 loops=1)
+   Tuples: inserted=1 updated=1                             
+   ->  Hash Full Join (actual rows=2.00 loops=1)            
+         Hash Cond: (t.key = (1))                           
++        Outer Rows Unmatched: 1.00                         
+         ->  Seq Scan on target t (actual rows=1.00 loops=1)
+         ->  Hash (actual rows=1.00 loops=1)                
+               ->  Result (actual rows=1.00 loops=1)        
+-(7 rows)
++(8 rows)
+ 
+ step select2: SELECT * FROM target;
+ key|val                                                   
+@@ -382,13 +383,14 @@ Merge on pa_target t (actual rows=2.00 loops=1)
+   Tuples: updated=2                                               
+   ->  Hash Full Join (actual rows=2.00 loops=1)                   
+         Hash Cond: (t.key = (1))                                  
++        Outer Rows Unmatched: 1.00                                
+         ->  Append (actual rows=2.00 loops=1)                     
+               ->  Seq Scan on part1 t_1 (actual rows=1.00 loops=1)
+               ->  Seq Scan on part2 t_2 (actual rows=1.00 loops=1)
+               ->  Seq Scan on part3 t_3 (actual rows=0.00 loops=1)
+         ->  Hash (actual rows=1.00 loops=1)                       
+               ->  Result (actual rows=1.00 loops=1)               
+-(13 rows)
++(14 rows)
+ 
+ step pa_select2: SELECT * FROM pa_target;
+ key|val                                               
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 7773852..1ca0c2e 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -13073,3 +13073,426 @@ WHERE s.x = s.c;
+ (1 row)
+ 
+ ROLLBACK;
++--
++-- EXPLAIN ANALYZE "Outer Rows Unmatched": the number of outer rows that found
++-- no partner.  The executor counts matched rows, which must not depend on the
++-- join method; unmatched ones are the outer child's rows minus matched.
++--
++BEGIN;
++CREATE TEMP TABLE om_o (a int, b int);
++INSERT INTO om_o SELECT i, i % 4 FROM generate_series(1, 1000) i;
++INSERT INTO om_o SELECT NULL, 0 FROM generate_series(1, 5);  -- NULL keys
++CREATE TEMP TABLE om_i (a int, c int);
++-- two inner rows per key 1..10, so a matched outer row has two partners
++INSERT INTO om_i SELECT i % 10 + 1, i FROM generate_series(1, 20) i;
++CREATE TEMP TABLE om_u (a int PRIMARY KEY);
++INSERT INTO om_u SELECT generate_series(1, 10);
++ANALYZE om_o, om_i, om_u;
++-- Hide lines whose content depends on the platform
++CREATE FUNCTION explain_om(query text) RETURNS SETOF text
++LANGUAGE plpgsql AS
++$$
++DECLARE
++    ln text;
++BEGIN
++    FOR ln IN
++        EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) %s',
++                       query)
++    LOOP
++        IF ln ~ 'Buckets:|Sort Method:|Storage:|Batches:' THEN
++            CONTINUE;
++        END IF;
++        RETURN NEXT ln;
++    END LOOP;
++END;
++$$;
++-- Report the unmatched outer-row count of every join node, from the JSON
++-- format
++CREATE FUNCTION explain_om_json(query text)
++RETURNS TABLE (node_type text, join_type text, loops text, unmatched text)
++LANGUAGE plpgsql AS
++$$
++DECLARE
++    plan jsonb;
++BEGIN
++    EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF, FORMAT JSON) %s',
++                   query) INTO plan;
++    RETURN QUERY
++        SELECT n->>'Node Type', n->>'Join Type', n->>'Actual Loops',
++               n->>'Outer Rows Unmatched'
++        FROM jsonb_path_query(plan, 'lax $.**') AS n
++        WHERE jsonb_typeof(n) = 'object' AND n ? 'Join Type';
++END;
++$$;
++SET LOCAL max_parallel_workers_per_gather = 0;
++-- Same query, same outer side, three join methods: 10 outer rows match
++-- every time, so 1005 - 10 = 995 are left unmatched.  The two partners per
++-- key must not be counted twice, NULL keys never match.  A merge join stops
++-- reading its outer side once the inner one is exhausted and counts only the
++-- rows it has read.
++SET LOCAL enable_hashjoin = on;
++SET LOCAL enable_mergejoin = off;
++SET LOCAL enable_nestloop = off;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Join (actual rows=20.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(6 rows)
++
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Left Join (actual rows=1015.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(6 rows)
++
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Anti Join (actual rows=995.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(6 rows)
++
++SELECT explain_om('SELECT * FROM om_o o FULL JOIN om_i i ON o.a = i.a');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Full Join (actual rows=1015.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(6 rows)
++
++-- the residual Join Filter decides the match too: only keys 1, 8, 9, 10
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Join (actual rows=4.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Join Filter: (i.c > (15 + o.b))
++   Rows Removed by Join Filter: 16
++   Outer Rows Unmatched: 1001.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(8 rows)
++
++-- a row rejected only by the node's Filter is still matched
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Left Join (actual rows=1013.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   Filter: (COALESCE(i.c, 0) <> ALL ('{3,13}'::integer[]))
++   Rows Removed by Filter: 2
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(8 rows)
++
++SET LOCAL enable_hashjoin = off;
++SET LOCAL enable_mergejoin = on;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Join (actual rows=20.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Outer Rows Unmatched: 1.00
++   ->  Sort (actual rows=11.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(9 rows)
++
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Left Join (actual rows=1015.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Sort (actual rows=1005.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(9 rows)
++
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Anti Join (actual rows=995.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Sort (actual rows=1005.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(9 rows)
++
++SELECT explain_om('SELECT * FROM om_o o FULL JOIN om_i i ON o.a = i.a');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Full Join (actual rows=1015.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Sort (actual rows=1005.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(9 rows)
++
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Join (actual rows=4.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Join Filter: (i.c > (15 + o.b))
++   Rows Removed by Join Filter: 16
++   Outer Rows Unmatched: 7.00
++   ->  Sort (actual rows=11.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(11 rows)
++
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++                          explain_om                          
++--------------------------------------------------------------
++ Merge Left Join (actual rows=1013.00 loops=1)
++   Merge Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   Filter: (COALESCE(i.c, 0) <> ALL ('{3,13}'::integer[]))
++   Rows Removed by Filter: 2
++   ->  Sort (actual rows=1005.00 loops=1)
++         Sort Key: o.a
++         ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Sort (actual rows=20.00 loops=1)
++         Sort Key: i.a
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(11 rows)
++
++SET LOCAL enable_mergejoin = off;
++SET LOCAL enable_nestloop = on;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++                         explain_om                         
++------------------------------------------------------------
++ Nested Loop (actual rows=20.00 loops=1)
++   Join Filter: (o.a = i.a)
++   Rows Removed by Join Filter: 20080
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Materialize (actual rows=20.00 loops=1005)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(7 rows)
++
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++                         explain_om                         
++------------------------------------------------------------
++ Nested Loop Left Join (actual rows=1015.00 loops=1)
++   Join Filter: (o.a = i.a)
++   Rows Removed by Join Filter: 20080
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Materialize (actual rows=20.00 loops=1005)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(7 rows)
++
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++                         explain_om                         
++------------------------------------------------------------
++ Nested Loop Anti Join (actual rows=995.00 loops=1)
++   Join Filter: (o.a = i.a)
++   Rows Removed by Join Filter: 19945
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Materialize (actual rows=19.86 loops=1005)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(7 rows)
++
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++                         explain_om                         
++------------------------------------------------------------
++ Nested Loop (actual rows=4.00 loops=1)
++   Join Filter: ((o.a = i.a) AND (i.c > (15 + o.b)))
++   Rows Removed by Join Filter: 20096
++   Outer Rows Unmatched: 1001.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Materialize (actual rows=20.00 loops=1005)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(7 rows)
++
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++                         explain_om                         
++------------------------------------------------------------
++ Nested Loop Left Join (actual rows=1013.00 loops=1)
++   Join Filter: (o.a = i.a)
++   Rows Removed by Join Filter: 20080
++   Outer Rows Unmatched: 995.00
++   Filter: (COALESCE(i.c, 0) <> ALL ('{3,13}'::integer[]))
++   Rows Removed by Filter: 2
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Materialize (actual rows=20.00 loops=1005)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(9 rows)
++
++-- Parameterized Nested Loop: the join keys move to the inner Index Cond,
++-- the number stays the same
++CREATE INDEX ON om_i (a);
++SET LOCAL enable_material = off;
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++                                explain_om                                 
++---------------------------------------------------------------------------
++ Nested Loop Left Join (actual rows=1015.00 loops=1)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Index Scan using om_i_a_idx on om_i i (actual rows=0.02 loops=1005)
++         Index Cond: (a = o.a)
++         Index Searches: 1000
++(6 rows)
++
++RESET enable_material;
++RESET enable_hashjoin;
++RESET enable_mergejoin;
++-- Cross-checks without a Filter: SEMI and INNER with a unique inner side
++-- return each matched outer row once, so rows + Outer Rows Unmatched gives
++-- the rows of the outer side
++SET LOCAL enable_hashagg = off;
++SET LOCAL enable_sort = off;
++SELECT explain_om('SELECT * FROM om_o o WHERE EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Semi Join (actual rows=10.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(6 rows)
++
++RESET enable_hashagg;
++RESET enable_sort;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_u u ON o.a = u.a');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Join (actual rows=10.00 loops=1)
++   Hash Cond: (o.a = u.a)
++   Outer Rows Unmatched: 995.00
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=10.00 loops=1)
++         ->  Seq Scan on om_u u (actual rows=10.00 loops=1)
++(6 rows)
++
++-- Rescan: the join runs once per VALUES row, 5 and 3 matches, so
++-- (1000 + 1002) / 2 unmatched on average
++SELECT explain_om('SELECT * FROM (VALUES (15), (17)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++                              explain_om                               
++-----------------------------------------------------------------------
++ Nested Loop (actual rows=2.00 loops=1)
++   ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
++   ->  Aggregate (actual rows=1.00 loops=2)
++         ->  Hash Join (actual rows=4.00 loops=2)
++               Hash Cond: (o.a = i.a)
++               Outer Rows Unmatched: 1001.00
++               ->  Seq Scan on om_o o (actual rows=1005.00 loops=2)
++               ->  Hash (actual rows=4.00 loops=2)
++                     ->  Seq Scan on om_i i (actual rows=4.00 loops=2)
++                           Filter: (c > "*VALUES*".column1)
++                           Rows Removed by Filter: 16
++(11 rows)
++
++-- The second loop gets an empty hash table and does not read its outer side
++-- at all, so it adds zero to the count.  They are averaged over the join's
++-- own loops, like every other counter on its line.
++SELECT explain_om('SELECT * FROM (VALUES (15), (100)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++                              explain_om                               
++-----------------------------------------------------------------------
++ Nested Loop (actual rows=2.00 loops=1)
++   ->  Values Scan on "*VALUES*" (actual rows=2.00 loops=1)
++   ->  Aggregate (actual rows=1.00 loops=2)
++         ->  Hash Join (actual rows=2.50 loops=2)
++               Hash Cond: (o.a = i.a)
++               Outer Rows Unmatched: 500.00
++               ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++               ->  Hash (actual rows=2.50 loops=2)
++                     ->  Seq Scan on om_i i (actual rows=2.50 loops=2)
++                           Filter: (c > "*VALUES*".column1)
++                           Rows Removed by Filter: 18
++(11 rows)
++
++SELECT * FROM explain_om_json('SELECT * FROM (VALUES (15), (100)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++  node_type  | join_type | loops | unmatched 
++-------------+-----------+-------+-----------
++ Nested Loop | Inner     | 1     | 0.00
++ Hash Join   | Inner     | 2     | 500.00
++(2 rows)
++
++-- Every outer row matched: no line in text, JSON still has the key
++SELECT explain_om('SELECT * FROM om_i i JOIN om_u u ON i.a = u.a');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Join (actual rows=20.00 loops=1)
++   Hash Cond: (i.a = u.a)
++   ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++   ->  Hash (actual rows=10.00 loops=1)
++         ->  Seq Scan on om_u u (actual rows=10.00 loops=1)
++(5 rows)
++
++SELECT * FROM explain_om_json('SELECT * FROM om_i i JOIN om_u u ON i.a = u.a');
++ node_type | join_type | loops | unmatched 
++-----------+-----------+-------+-----------
++ Hash Join | Inner     | 1     | 0.00
++(1 row)
++
++-- Right semi join cannot tell matched outer rows: nothing in any format
++SET LOCAL enable_nestloop = off;
++SET LOCAL enable_mergejoin = off;
++SELECT explain_om('SELECT * FROM om_i i WHERE EXISTS (SELECT 1 FROM om_o o WHERE o.a = i.a)');
++                         explain_om                         
++------------------------------------------------------------
++ Hash Right Semi Join (actual rows=20.00 loops=1)
++   Hash Cond: (o.a = i.a)
++   ->  Seq Scan on om_o o (actual rows=1005.00 loops=1)
++   ->  Hash (actual rows=20.00 loops=1)
++         ->  Seq Scan on om_i i (actual rows=20.00 loops=1)
++(5 rows)
++
++SELECT * FROM explain_om_json('SELECT * FROM om_i i WHERE EXISTS (SELECT 1 FROM om_o o WHERE o.a = i.a)');
++ node_type | join_type  | loops | unmatched 
++-----------+------------+-------+-----------
++ Hash Join | Right Semi | 1     | 
++(1 row)
++
++ROLLBACK;
+diff --git a/src/test/regress/expected/join_hash.out b/src/test/regress/expected/join_hash.out
+index 75009e2..5afc8fd 100644
+--- a/src/test/regress/expected/join_hash.out
++++ b/src/test/regress/expected/join_hash.out
+@@ -956,6 +956,137 @@ $$);
+  t
+ (1 row)
+ 
++rollback to settings;
++-- The unmatched outer-row count must not depend on the number of batches nor
++-- on parallelism.  The outer side has 20001 rows (one with a NULL key), 6666
++-- of them find a partner in simple_third and 13335 do not.  JSON gives a
++-- per-loop average with two decimal places; times the number of loops it gives
++-- back the total.
++create table simple_third as select id from simple where id % 3 = 0;
++alter table simple_third set (parallel_workers = 2);
++analyze simple_third;
++create or replace function hash_join_outer_unmatched(query text)
++returns table (unmatched numeric, loops int)
++language plpgsql
++as
++$$
++declare
++  whole_plan jsonb;
++  node jsonb;
++begin
++  execute 'explain (analyze, costs off, timing off, summary off, buffers off, format json) '
++          || query into whole_plan;
++  select n into node
++    from jsonb_path_query(whole_plan, 'lax $.**') as n
++    where jsonb_typeof(n) = 'object' and n->>'Node Type' = 'Hash Join';
++  loops := (node->>'Actual Loops')::int;
++  unmatched := round((node->>'Outer Rows Unmatched')::numeric * loops);
++  return next;
++end;
++$$;
++-- non-parallel, one batch
++savepoint settings;
++set local max_parallel_workers_per_gather = 0;
++set local work_mem = '4MB';
++set local hash_mem_multiplier = 1.0;
++select unmatched, loops from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++ unmatched | loops 
++-----------+-------
++     13335 |     1
++(1 row)
++
++rollback to settings;
++-- non-parallel, several batches
++savepoint settings;
++set local max_parallel_workers_per_gather = 0;
++set local work_mem = '64kB';
++set local hash_mem_multiplier = 1.0;
++select final > 1 as multibatch
++  from hash_join_batches(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++ multibatch 
++------------
++ t
++(1 row)
++
++select unmatched, loops from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++ unmatched | loops 
++-----------+-------
++     13335 |     1
++(1 row)
++
++rollback to settings;
++-- parallel with parallel-oblivious hash join
++savepoint settings;
++set local max_parallel_workers_per_gather = 2;
++set local work_mem = '4MB';
++set local hash_mem_multiplier = 1.0;
++set local enable_parallel_hash = off;
++-- keep the inner side serial, so that every worker builds its own hash table
++alter table simple_third set (parallel_workers = 0);
++explain (costs off)
++  select count(*) from simple r join simple_third s using (id);
++                        QUERY PLAN                        
++----------------------------------------------------------
++ Finalize Aggregate
++   ->  Gather
++         Workers Planned: 2
++         ->  Partial Aggregate
++               ->  Hash Join
++                     Hash Cond: (r.id = s.id)
++                     ->  Parallel Seq Scan on simple r
++                     ->  Hash
++                           ->  Seq Scan on simple_third s
++(9 rows)
++
++select unmatched from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++ unmatched 
++-----------
++     13335
++(1 row)
++
++rollback to settings;
++-- parallel with parallel-aware hash join, several batches
++savepoint settings;
++set local max_parallel_workers_per_gather = 2;
++set local work_mem = '64kB';
++set local hash_mem_multiplier = 1.0;
++set local enable_parallel_hash = on;
++explain (costs off)
++  select count(*) from simple r join simple_third s using (id);
++                            QUERY PLAN                             
++-------------------------------------------------------------------
++ Finalize Aggregate
++   ->  Gather
++         Workers Planned: 2
++         ->  Partial Aggregate
++               ->  Parallel Hash Join
++                     Hash Cond: (r.id = s.id)
++                     ->  Parallel Seq Scan on simple r
++                     ->  Parallel Hash
++                           ->  Parallel Seq Scan on simple_third s
++(9 rows)
++
++select unmatched from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++ unmatched 
++-----------
++     13335
++(1 row)
++
+ rollback to settings;
+ -- Hash join reuses the HOT status bit to indicate match status. This can only
+ -- be guaranteed to produce correct results if all the hash join tuple match
+diff --git a/src/test/regress/expected/memoize.out b/src/test/regress/expected/memoize.out
+index 30bf5f5..6cbce40 100644
+--- a/src/test/regress/expected/memoize.out
++++ b/src/test/regress/expected/memoize.out
+@@ -691,6 +691,7 @@ WHERE t2.a IS NULL;', false);
+ --------------------------------------------------------------------------------------------
+  Aggregate (actual rows=1.00 loops=N)
+    ->  Nested Loop Anti Join (actual rows=33.00 loops=N)
++         Outer Rows Unmatched: 33.00
+          ->  Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)
+          ->  Memoize (actual rows=0.67 loops=N)
+                Cache Key: (t1.a + 1), t1.a
+@@ -704,7 +705,7 @@ WHERE t2.a IS NULL;', false);
+                                  Sort Key: t2_1.a
+                                  Sort Method: quicksort  Memory: NkB
+                                  ->  Seq Scan on tab_anti t2_1 (actual rows=100.00 loops=N)
+-(15 rows)
++(16 rows)
+ 
+ -- And check we get the expected results.
+ SELECT COUNT(*) FROM tab_anti t1 LEFT JOIN
+diff --git a/src/test/regress/expected/merge.out b/src/test/regress/expected/merge.out
+index 9cb1d87..a371d50 100644
+--- a/src/test/regress/expected/merge.out
++++ b/src/test/regress/expected/merge.out
+@@ -1707,6 +1707,7 @@ WHEN NOT MATCHED AND s.a < 10 THEN
+    Tuples: inserted=4 skipped=96
+    ->  Merge Left Join (actual rows=100.00 loops=1)
+          Merge Cond: (s.a = t.a)
++         Outer Rows Unmatched: 55.00
+          ->  Sort (actual rows=100.00 loops=1)
+                Sort Key: s.a
+                Sort Method: quicksort  Memory: xxx
+@@ -1715,7 +1716,7 @@ WHEN NOT MATCHED AND s.a < 10 THEN
+                Sort Key: t.a
+                Sort Method: quicksort  Memory: xxx
+                ->  Seq Scan on ex_mtarget t (actual rows=45.00 loops=1)
+-(12 rows)
++(13 rows)
+ 
+ -- all three
+ SELECT explain_merge('
+@@ -1732,6 +1733,7 @@ WHEN NOT MATCHED AND s.a < 20 THEN
+    Tuples: inserted=10 updated=9 deleted=5 skipped=76
+    ->  Merge Left Join (actual rows=100.00 loops=1)
+          Merge Cond: (s.a = t.a)
++         Outer Rows Unmatched: 51.00
+          ->  Sort (actual rows=100.00 loops=1)
+                Sort Key: s.a
+                Sort Method: quicksort  Memory: xxx
+@@ -1740,7 +1742,7 @@ WHEN NOT MATCHED AND s.a < 20 THEN
+                Sort Key: t.a
+                Sort Method: quicksort  Memory: xxx
+                ->  Seq Scan on ex_mtarget t (actual rows=49.00 loops=1)
+-(12 rows)
++(13 rows)
+ 
+ -- not matched by source
+ SELECT explain_merge('
+diff --git a/src/test/regress/expected/partition_prune.out b/src/test/regress/expected/partition_prune.out
+index 3506ece..f74e7d1 100644
+--- a/src/test/regress/expected/partition_prune.out
++++ b/src/test/regress/expected/partition_prune.out
+@@ -2571,6 +2571,7 @@ begin
+         ln := regexp_replace(ln, 'Workers Launched: \d+', 'Workers Launched: N');
+         ln := regexp_replace(ln, 'actual rows=\d+(?:\.\d+)? loops=\d+', 'actual rows=N loops=N');
+         ln := regexp_replace(ln, 'Rows Removed by Filter: \d+', 'Rows Removed by Filter: N');
++        ln := regexp_replace(ln, 'Outer Rows Unmatched: \d+(?:\.\d+)?', 'Outer Rows Unmatched: N');
+         perform regexp_matches(ln, 'Index Searches: \d+');
+         if found then
+           continue;
+@@ -2711,6 +2712,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+          Workers Launched: N
+          ->  Partial Aggregate (actual rows=N loops=N)
+                ->  Nested Loop (actual rows=N loops=N)
++                     Outer Rows Unmatched: N
+                      ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+                            Filter: (a = ANY ('{0,0,1}'::integer[]))
+                      ->  Append (actual rows=N loops=N)
+@@ -2732,7 +2734,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+                                  Index Cond: (a = a.a)
+                            ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
+                                  Index Cond: (a = a.a)
+-(27 rows)
++(28 rows)
+ 
+ -- Ensure the same partitions are pruned when we make the nested loop
+ -- parameter an Expr rather than a plain Param.
+@@ -2745,6 +2747,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+          Workers Launched: N
+          ->  Partial Aggregate (actual rows=N loops=N)
+                ->  Nested Loop (actual rows=N loops=N)
++                     Outer Rows Unmatched: N
+                      ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+                            Filter: (a = ANY ('{0,0,1}'::integer[]))
+                      ->  Append (actual rows=N loops=N)
+@@ -2766,7 +2769,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+                                  Index Cond: (a = (a.a + 0))
+                            ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
+                                  Index Cond: (a = (a.a + 0))
+-(27 rows)
++(28 rows)
+ 
+ insert into lprt_a values(3),(3);
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 3)');
+@@ -2778,6 +2781,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+          Workers Launched: N
+          ->  Partial Aggregate (actual rows=N loops=N)
+                ->  Nested Loop (actual rows=N loops=N)
++                     Outer Rows Unmatched: N
+                      ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+                            Filter: (a = ANY ('{1,0,3}'::integer[]))
+                      ->  Append (actual rows=N loops=N)
+@@ -2799,7 +2803,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+                                  Index Cond: (a = a.a)
+                            ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (actual rows=N loops=N)
+                                  Index Cond: (a = a.a)
+-(27 rows)
++(28 rows)
+ 
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
+                                         explain_parallel_append                                         
+@@ -2810,6 +2814,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+          Workers Launched: N
+          ->  Partial Aggregate (actual rows=N loops=N)
+                ->  Nested Loop (actual rows=N loops=N)
++                     Outer Rows Unmatched: N
+                      ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+                            Filter: (a = ANY ('{1,0,0}'::integer[]))
+                            Rows Removed by Filter: N
+@@ -2832,7 +2837,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+                                  Index Cond: (a = a.a)
+                            ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
+                                  Index Cond: (a = a.a)
+-(28 rows)
++(29 rows)
+ 
+ delete from lprt_a where a = 1;
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
+@@ -2844,6 +2849,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+          Workers Launched: N
+          ->  Partial Aggregate (actual rows=N loops=N)
+                ->  Nested Loop (actual rows=N loops=N)
++                     Outer Rows Unmatched: N
+                      ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+                            Filter: (a = ANY ('{1,0,0}'::integer[]))
+                            Rows Removed by Filter: N
+@@ -2866,7 +2872,7 @@ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on
+                                  Index Cond: (a = a.a)
+                            ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
+                                  Index Cond: (a = a.a)
+-(28 rows)
++(29 rows)
+ 
+ reset enable_hashjoin;
+ reset enable_mergejoin;
+@@ -3318,6 +3324,7 @@ select * from tbl1 inner join tprt on tbl1.col1 = tprt.col1;
+                                  QUERY PLAN                                  
+ -----------------------------------------------------------------------------
+  Nested Loop (actual rows=3.00 loops=1)
++   Outer Rows Unmatched: 2.00
+    ->  Seq Scan on tbl1 (actual rows=5.00 loops=1)
+    ->  Append (actual rows=0.60 loops=5)
+          ->  Index Scan using tprt1_idx on tprt_1 (never executed)
+@@ -3338,7 +3345,7 @@ select * from tbl1 inner join tprt on tbl1.col1 = tprt.col1;
+          ->  Index Scan using tprt6_idx on tprt_6 (never executed)
+                Index Cond: (col1 = tbl1.col1)
+                Index Searches: 0
+-(21 rows)
++(22 rows)
+ 
+ select tbl1.col1, tprt.col1 from tbl1
+ inner join tprt on tbl1.col1 > tprt.col1
+@@ -3426,6 +3433,7 @@ select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
+                             QUERY PLAN                             
+ -------------------------------------------------------------------
+  Nested Loop (actual rows=0.00 loops=1)
++   Outer Rows Unmatched: 1.00
+    ->  Seq Scan on tbl1 (actual rows=1.00 loops=1)
+    ->  Append (actual rows=0.00 loops=1)
+          ->  Index Scan using tprt1_idx on tprt_1 (never executed)
+@@ -3446,7 +3454,7 @@ select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
+          ->  Index Scan using tprt6_idx on tprt_6 (never executed)
+                Index Cond: (col1 = tbl1.col1)
+                Index Searches: 0
+-(21 rows)
++(22 rows)
+ 
+ select tbl1.col1, tprt.col1 from tbl1
+ inner join tprt on tbl1.col1 = tprt.col1
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index a49d343..546392b 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -4978,3 +4978,143 @@ FROM (VALUES (1)) AS v(z) LEFT JOIN
+ WHERE s.x = s.c;
+ 
+ ROLLBACK;
++
++--
++-- EXPLAIN ANALYZE "Outer Rows Unmatched": the number of outer rows that found
++-- no partner.  The executor counts matched rows, which must not depend on the
++-- join method; unmatched ones are the outer child's rows minus matched.
++--
++BEGIN;
++
++CREATE TEMP TABLE om_o (a int, b int);
++INSERT INTO om_o SELECT i, i % 4 FROM generate_series(1, 1000) i;
++INSERT INTO om_o SELECT NULL, 0 FROM generate_series(1, 5);  -- NULL keys
++CREATE TEMP TABLE om_i (a int, c int);
++-- two inner rows per key 1..10, so a matched outer row has two partners
++INSERT INTO om_i SELECT i % 10 + 1, i FROM generate_series(1, 20) i;
++CREATE TEMP TABLE om_u (a int PRIMARY KEY);
++INSERT INTO om_u SELECT generate_series(1, 10);
++ANALYZE om_o, om_i, om_u;
++
++-- Hide lines whose content depends on the platform
++CREATE FUNCTION explain_om(query text) RETURNS SETOF text
++LANGUAGE plpgsql AS
++$$
++DECLARE
++    ln text;
++BEGIN
++    FOR ln IN
++        EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) %s',
++                       query)
++    LOOP
++        IF ln ~ 'Buckets:|Sort Method:|Storage:|Batches:' THEN
++            CONTINUE;
++        END IF;
++        RETURN NEXT ln;
++    END LOOP;
++END;
++$$;
++
++-- Report the unmatched outer-row count of every join node, from the JSON
++-- format
++CREATE FUNCTION explain_om_json(query text)
++RETURNS TABLE (node_type text, join_type text, loops text, unmatched text)
++LANGUAGE plpgsql AS
++$$
++DECLARE
++    plan jsonb;
++BEGIN
++    EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF, FORMAT JSON) %s',
++                   query) INTO plan;
++    RETURN QUERY
++        SELECT n->>'Node Type', n->>'Join Type', n->>'Actual Loops',
++               n->>'Outer Rows Unmatched'
++        FROM jsonb_path_query(plan, 'lax $.**') AS n
++        WHERE jsonb_typeof(n) = 'object' AND n ? 'Join Type';
++END;
++$$;
++
++SET LOCAL max_parallel_workers_per_gather = 0;
++
++-- Same query, same outer side, three join methods: 10 outer rows match
++-- every time, so 1005 - 10 = 995 are left unmatched.  The two partners per
++-- key must not be counted twice, NULL keys never match.  A merge join stops
++-- reading its outer side once the inner one is exhausted and counts only the
++-- rows it has read.
++SET LOCAL enable_hashjoin = on;
++SET LOCAL enable_mergejoin = off;
++SET LOCAL enable_nestloop = off;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++SELECT explain_om('SELECT * FROM om_o o FULL JOIN om_i i ON o.a = i.a');
++-- the residual Join Filter decides the match too: only keys 1, 8, 9, 10
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++-- a row rejected only by the node's Filter is still matched
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++
++SET LOCAL enable_hashjoin = off;
++SET LOCAL enable_mergejoin = on;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++SELECT explain_om('SELECT * FROM om_o o FULL JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++
++SET LOCAL enable_mergejoin = off;
++SET LOCAL enable_nestloop = on;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++SELECT explain_om('SELECT * FROM om_o o WHERE NOT EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++SELECT explain_om('SELECT * FROM om_o o JOIN om_i i ON o.a = i.a AND i.c > 15 + o.b');
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a
++                   WHERE coalesce(i.c, 0) NOT IN (3, 13)');
++
++-- Parameterized Nested Loop: the join keys move to the inner Index Cond,
++-- the number stays the same
++CREATE INDEX ON om_i (a);
++SET LOCAL enable_material = off;
++SELECT explain_om('SELECT * FROM om_o o LEFT JOIN om_i i ON o.a = i.a');
++RESET enable_material;
++RESET enable_hashjoin;
++RESET enable_mergejoin;
++
++-- Cross-checks without a Filter: SEMI and INNER with a unique inner side
++-- return each matched outer row once, so rows + Outer Rows Unmatched gives
++-- the rows of the outer side
++SET LOCAL enable_hashagg = off;
++SET LOCAL enable_sort = off;
++SELECT explain_om('SELECT * FROM om_o o WHERE EXISTS (SELECT 1 FROM om_i i WHERE o.a = i.a)');
++RESET enable_hashagg;
++RESET enable_sort;
++SELECT explain_om('SELECT * FROM om_o o JOIN om_u u ON o.a = u.a');
++
++-- Rescan: the join runs once per VALUES row, 5 and 3 matches, so
++-- (1000 + 1002) / 2 unmatched on average
++SELECT explain_om('SELECT * FROM (VALUES (15), (17)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++-- The second loop gets an empty hash table and does not read its outer side
++-- at all, so it adds zero to the count.  They are averaged over the join's
++-- own loops, like every other counter on its line.
++SELECT explain_om('SELECT * FROM (VALUES (15), (100)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++SELECT * FROM explain_om_json('SELECT * FROM (VALUES (15), (100)) v(x) CROSS JOIN LATERAL
++                     (SELECT count(*) FROM om_o o JOIN om_i i
++                        ON o.a = i.a AND i.c > v.x OFFSET 0) s');
++
++-- Every outer row matched: no line in text, JSON still has the key
++SELECT explain_om('SELECT * FROM om_i i JOIN om_u u ON i.a = u.a');
++SELECT * FROM explain_om_json('SELECT * FROM om_i i JOIN om_u u ON i.a = u.a');
++
++-- Right semi join cannot tell matched outer rows: nothing in any format
++SET LOCAL enable_nestloop = off;
++SET LOCAL enable_mergejoin = off;
++SELECT explain_om('SELECT * FROM om_i i WHERE EXISTS (SELECT 1 FROM om_o o WHERE o.a = i.a)');
++SELECT * FROM explain_om_json('SELECT * FROM om_i i WHERE EXISTS (SELECT 1 FROM om_o o WHERE o.a = i.a)');
++
++ROLLBACK;
+diff --git a/src/test/regress/sql/join_hash.sql b/src/test/regress/sql/join_hash.sql
+index 989390e..2b548f9 100644
+--- a/src/test/regress/sql/join_hash.sql
++++ b/src/test/regress/sql/join_hash.sql
+@@ -509,6 +509,91 @@ $$);
+ rollback to settings;
+ 
+ 
++-- The unmatched outer-row count must not depend on the number of batches nor
++-- on parallelism.  The outer side has 20001 rows (one with a NULL key), 6666
++-- of them find a partner in simple_third and 13335 do not.  JSON gives a
++-- per-loop average with two decimal places; times the number of loops it gives
++-- back the total.
++create table simple_third as select id from simple where id % 3 = 0;
++alter table simple_third set (parallel_workers = 2);
++analyze simple_third;
++create or replace function hash_join_outer_unmatched(query text)
++returns table (unmatched numeric, loops int)
++language plpgsql
++as
++$$
++declare
++  whole_plan jsonb;
++  node jsonb;
++begin
++  execute 'explain (analyze, costs off, timing off, summary off, buffers off, format json) '
++          || query into whole_plan;
++  select n into node
++    from jsonb_path_query(whole_plan, 'lax $.**') as n
++    where jsonb_typeof(n) = 'object' and n->>'Node Type' = 'Hash Join';
++  loops := (node->>'Actual Loops')::int;
++  unmatched := round((node->>'Outer Rows Unmatched')::numeric * loops);
++  return next;
++end;
++$$;
++
++-- non-parallel, one batch
++savepoint settings;
++set local max_parallel_workers_per_gather = 0;
++set local work_mem = '4MB';
++set local hash_mem_multiplier = 1.0;
++select unmatched, loops from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++rollback to settings;
++
++-- non-parallel, several batches
++savepoint settings;
++set local max_parallel_workers_per_gather = 0;
++set local work_mem = '64kB';
++set local hash_mem_multiplier = 1.0;
++select final > 1 as multibatch
++  from hash_join_batches(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++select unmatched, loops from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++rollback to settings;
++
++-- parallel with parallel-oblivious hash join
++savepoint settings;
++set local max_parallel_workers_per_gather = 2;
++set local work_mem = '4MB';
++set local hash_mem_multiplier = 1.0;
++set local enable_parallel_hash = off;
++-- keep the inner side serial, so that every worker builds its own hash table
++alter table simple_third set (parallel_workers = 0);
++explain (costs off)
++  select count(*) from simple r join simple_third s using (id);
++select unmatched from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++rollback to settings;
++
++-- parallel with parallel-aware hash join, several batches
++savepoint settings;
++set local max_parallel_workers_per_gather = 2;
++set local work_mem = '64kB';
++set local hash_mem_multiplier = 1.0;
++set local enable_parallel_hash = on;
++explain (costs off)
++  select count(*) from simple r join simple_third s using (id);
++select unmatched from hash_join_outer_unmatched(
++$$
++  select count(*) from simple r join simple_third s using (id)
++$$);
++rollback to settings;
++
+ -- Hash join reuses the HOT status bit to indicate match status. This can only
+ -- be guaranteed to produce correct results if all the hash join tuple match
+ -- bits are reset before reuse. This is done upon loading them into the
+diff --git a/src/test/regress/sql/partition_prune.sql b/src/test/regress/sql/partition_prune.sql
+index d6e096d..5dae8d8 100644
+--- a/src/test/regress/sql/partition_prune.sql
++++ b/src/test/regress/sql/partition_prune.sql
+@@ -681,6 +681,7 @@ begin
+         ln := regexp_replace(ln, 'Workers Launched: \d+', 'Workers Launched: N');
+         ln := regexp_replace(ln, 'actual rows=\d+(?:\.\d+)? loops=\d+', 'actual rows=N loops=N');
+         ln := regexp_replace(ln, 'Rows Removed by Filter: \d+', 'Rows Removed by Filter: N');
++        ln := regexp_replace(ln, 'Outer Rows Unmatched: \d+(?:\.\d+)?', 'Outer Rows Unmatched: N');
+         perform regexp_matches(ln, 'Index Searches: \d+');
+         if found then
+           continue;
+-- 
+2.34.1
+
