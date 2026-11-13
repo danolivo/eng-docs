@@ -12,7 +12,8 @@ ANALYZE;
 -- Optional, case X2: give the database of node 2 other session defaults.
 -- A tool that does not pin its own settings then sees differences in
 -- txt.x02_session and in every table with dates, intervals, bytea or money.
--- Put the name of the database and run by hand:
+-- Put the name of the database and run by hand. The locale of lc_monetary
+-- must exist on the server ("locale -a"); any locale but C will do.
 --
 --   ALTER DATABASE mydb SET TimeZone = 'Asia/Tokyo';
 --   ALTER DATABASE mydb SET DateStyle = 'SQL, DMY';
