@@ -1,0 +1,18 @@
+-- Case X11: a node whose database has the SQL_ASCII encoding.
+-- Stand: node 1 is a UTF8 database; node 2 is a database made with
+--          createdb -E SQL_ASCII -l C -T template0 <name>
+-- Run:   node 1 script in the UTF8 database, node 2 script in the SQL_ASCII one.
+-- Expect: rows 1, 2 equal (row 2 holds the UTF-8 bytes of the same text).
+--         Row 3 holds a LATIN1 byte on node 2: the server does no conversion
+--         for SQL_ASCII, so bytes that are not valid UTF-8 reach the client.
+--         The comparison must report row 3 as changed and row 4 as a row only
+--         on node 2, and must not fail on the bytes or write a broken report.
+DROP TABLE IF EXISTS sp.x11_bytes;
+CREATE TABLE sp.x11_bytes (id int PRIMARY KEY, v text);
+\if :n1
+INSERT INTO sp.x11_bytes VALUES (1, 'plain'), (2, U&'caf\00E9'), (3, U&'caf\00E9');
+\else
+SET client_encoding = 'SQL_ASCII';
+INSERT INTO sp.x11_bytes VALUES (1, 'plain'), (2, E'caf\303\251'), (3, E'caf\351'), (4, E'raw \377\376 bytes');
+\endif
+COMMENT ON TABLE sp.x11_bytes IS 'X11: rows 1, 2 equal; row 3 changed (a byte that is not UTF-8 on node 2); row 4 only on node 2';

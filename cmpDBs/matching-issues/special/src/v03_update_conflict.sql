@@ -1,0 +1,17 @@
+-- Case V3: the same rows updated on both nodes after the Merkle tree was built.
+-- Stand: a stand where mtree works (CDC). Two steps.
+-- Run:   1. this script on both nodes (the same data), then mtree init and
+--           mtree build for sp.v03_conflict;
+--        2. v03_update_conflict_step on each node, then mtree update and
+--           mtree table-diff. If the nodes replicate to each other, run the
+--           step where its changes are not replicated (for Spock: inside
+--           BEGIN; SELECT spock.repair_mode(true); ... COMMIT;).
+-- Expect after step 2: 5 changed rows (ids 10000, 25000, 50000, 75000, 99990),
+--         500 rows only on node 1 (ids 20005 .. 24995, new) and 500 rows only
+--         on node 1 (ids 70000 .. 74990, deleted on node 2). The inserts and
+--         deletes make the leaves of the two trees cover different key ranges;
+--         the 5 rows changed on both sides must still be found.
+DROP TABLE IF EXISTS sp.v03_conflict;
+CREATE TABLE sp.v03_conflict (id int PRIMARY KEY, v text);
+INSERT INTO sp.v03_conflict SELECT i * 10, 'v' || i FROM generate_series(1, 10000) i;
+COMMENT ON TABLE sp.v03_conflict IS 'V3: equal after step 1; after step 2: 5 changed rows and 1000 rows only on node 1';

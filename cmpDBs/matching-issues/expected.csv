@@ -1,0 +1,198 @@
+table,kind_n1,kind_n2,key,rows_n1,rows_n2,text_only_n1,text_only_n2,text_changed,eq_only_n1,eq_only_n2,eq_changed,notes
+dmp.p04_lost_table,table,table,id,50000,0,50000,0,0,50000,0,0,
+dmp.p05_key_lost,table,table,,3,4,0,1,,,,,primary key differs: (id) / (); the key (id) is not unique on one node: whole rows are compared as a set with counts
+dmp.p07_catalog_oids,table,table,id,1,1,0,0,1,0,0,1,
+dmp.p09_hash_enum,partitioned table,partitioned table,"e, id",800,800,0,0,0,0,0,0,
+dmp.p10_child,table,table,id,2,2,0,0,0,0,0,0,column order differs
+dmp.p10_parent,table,table,id,3,3,0,0,0,0,0,0,
+dmp.p11_generated,table,table,id,3,3,0,0,2,0,0,2,
+dmp.p16_seq_tbl,table,table,id,3,3,0,0,0,0,0,0,
+dmp.p19_physical,table,table,id,5000,5000,0,0,0,0,0,0,
+dty.d01_bytea,table,table,id,8,6,2,0,4,2,0,4,
+dty.d02_misc_types,table,table,id,3,2,1,0,1,1,0,1,no operator = for the column p; no operator = for the column pg; no operator = for the column x; no operator = for the column js
+dty.d04_arrays,table,table,id,3,2,1,0,1,1,0,1,
+dty.d05_ext_types,table,table,id,3,2,1,0,1,1,0,1,
+dty.d08_arrays_md,table,table,id,3,2,1,0,1,1,0,1,
+dty.d09_ext,table,table,id,3,2,1,0,1,1,0,1,
+dty.d11_internal,table,table,id,3,2,1,0,1,1,0,1,
+dty.d12_canonical,table,table,id,1,1,0,0,0,0,0,0,
+dty.d13_matview,materialized view,materialized view,,3,3,2,2,,,,,no common primary key: whole rows are compared as a set with counts
+dty.d13_src,table,table,id,30,30,0,0,1,0,0,1,
+dty.d13_unlogged,table,table,id,3,2,1,0,1,1,0,1,
+dty.d13_view,view,view,,10,11,0,1,,,,,no common primary key: whole rows are compared as a set with counts
+eqv.e01_interval,table,table,id,3,3,0,0,2,0,0,0,
+eqv.e02_timetz,table,table,id,2,2,0,0,1,0,0,1,
+eqv.e03_citext,table,table,id,2,2,0,0,1,0,0,0,
+eqv.e03_citext_key,table,table,id,2,2,1,1,0,0,0,0,
+eqv.e04_nfc_nfd,table,table,id,2,2,0,0,1,0,0,1,
+eqv.e04_nfc_nfd_key,table,table,id,2,2,1,1,0,0,0,0,
+eqv.e04_nondet,table,table,id,2,2,0,0,1,0,0,0,
+eqv.e04_nondet_key,table,table,id,2,2,1,1,0,0,0,0,
+eqv.e05_jsonb,table,table,id,3,3,0,0,1,0,0,0,
+eqv.e08_text_key_collation,table,table,id,5008,5008,0,0,9,0,0,9,
+eqv.e09_bpchar,table,table,id,2,2,0,0,1,0,0,0,
+eqv.e09_bpchar_key,table,table,id,2,2,1,1,0,0,0,0,
+eqv.e10_range,table,table,id,2,2,0,0,1,0,0,0,
+eqv.e11_array_bounds,table,table,id,3,2,1,0,1,1,0,1,
+eqv.e12_array_nulls,table,table,id,8,8,0,0,4,0,0,4,
+eqv.e13_row_nulls,table,table,id,4,4,0,0,1,0,0,2,
+eqv.e14_json,table,table,id,4,4,0,0,3,0,0,0,no operator = for the column j
+eqv.e15_time,table,table,id,2,2,0,0,1,0,0,1,
+eqv.e16_interval_key,table,table,id,3,2,2,1,0,1,0,0,
+eqv.e17_invisible,table,table,id,6,6,0,0,6,0,0,6,
+eqv.e18_xml,table,table,id,4,4,0,0,2,0,0,0,no operator = for the column x
+"key.""K08 Mixed Case""",table,table,Id,3,2,1,0,1,1,0,1,
+key.k01_uuid,table,table,id,3001,3000,2,1,8,2,1,8,
+key.k02_bytea_key,table,table,id,3000,3000,0,0,8,0,0,8,
+key.k02_enum_key,table,table,"sz, n",3000,3000,0,0,8,0,0,8,
+key.k02_money_key,table,table,id,3000,3000,0,0,8,0,0,8,
+key.k02_numeric_order,table,table,id,3000,3000,0,0,9,0,0,9,
+key.k03_date_key,table,table,id,2002,2001,1,0,2,1,0,2,
+key.k03_ts_key,table,table,id,2002,2001,1,0,2,1,0,2,
+key.k03_tstz_key,table,table,id,2002,2001,1,0,2,1,0,2,
+key.k04_pk_order,table,table,"grp, id",3000,2999,1,0,8,1,0,8,
+key.k05_range_gap,table,table,id,901,1100,0,199,0,0,199,0,
+key.k06_boundary,table,table,id,20000,20000,0,0,60,0,0,60,
+key.k07_mixed_text_key,table,table,id,13,9,4,0,5,4,0,5,
+key.k09_alias_names,table,table,id,3,2,1,0,1,1,0,1,
+key.k10_domain_key,table,table,id,3,2,1,0,1,1,0,1,
+key.k10_hstore_key,table,table,id,3,2,1,0,1,1,0,1,
+key.k10_ltree_key,table,table,id,4,3,1,0,1,1,0,1,
+key.k10_range_key,table,table,id,4,3,1,0,1,1,0,1,
+key.k11_wide_120,table,table,id,50,49,1,0,2,1,0,2,
+key.k12_replident_full,table,table,,3,2,1,0,,,,,no common primary key: whole rows are compared as a set with counts
+key.k12_replident_index,table,table,,2,2,1,1,,,,,no common primary key: whole rows are compared as a set with counts
+key.k12_unique_notnull,table,table,,2,2,1,1,,,,,no common primary key: whole rows are compared as a set with counts
+key.k13_pk_differs,table,table,,2,3,0,1,,,,,"primary key differs: (id) / (id, region); the key (id) is not unique on one node: whole rows are compared as a set with counts"
+key.k14_deferrable_pk,table,table,id,3,2,1,0,1,1,0,1,
+key.k15_special_keys,table,table,id,13,8,5,0,7,5,0,7,
+key.k16_key_collation,table,table,id,5004,5004,0,0,3,,,,operator rule not computed: could not determine which collation to use for string hashing
+key.k19_skewed,table,table,"tenant, id",10001,10001,0,0,5,0,0,5,
+key.k20_empty_both,table,table,id,0,0,0,0,0,0,0,0,
+key.k20_empty_n1,table,table,id,0,3,0,3,0,0,3,0,
+key.k20_empty_n2,table,table,id,3,0,3,0,0,3,0,0,
+key.k20_one_row,table,table,id,1,1,0,0,0,0,0,0,
+key.k20_one_row_diff,table,table,id,1,1,0,0,1,0,0,1,
+lob.l01_doc,table,table,id,1,1,0,0,0,0,0,0,
+lob.l02_doc,table,table,id,1,1,0,0,0,0,0,0,
+lob.l03_doc,table,table,id,2,2,0,0,0,0,0,0,
+lob.l04_doc,table,table,id,1,1,0,0,1,0,0,1,
+lob.l05_doc,table,table,id,4,4,0,0,1,0,0,1,
+lob.l06_doc_lo,table,table,id,2,2,1,1,1,1,1,1,
+lob.l06_doc_lo_always,table,table,id,2,2,1,1,1,1,1,1,
+lob.l07_doc,table,table,id,1,1,0,0,0,0,0,0,
+lob.l08_pages,table,table,"doc_id, pageno",200,199,1,0,1,1,0,1,
+lob.l09_doc,table,table,id,1,1,0,0,0,0,0,0,
+lob.l10_doc,table,table,id,2,2,0,0,0,0,0,0,
+lob.l12_oid_col,table,table,id,3,2,1,0,1,1,0,1,
+lob.l13_oid_key,table,table,id,5,4,1,0,2,1,0,2,
+lob.l14_reg,table,table,id,3,2,1,0,0,1,0,0,
+nul.u01_null_empty,table,table,id,5,5,0,0,3,0,0,3,
+nul.u02_separator,table,table,id,5,5,0,0,5,0,0,5,
+nul.u03_nil_literal,table,table,id,5,4,1,0,2,1,0,2,
+nul.u04_null_words,table,table,id,7,5,2,0,4,2,0,4,
+nul.u05_null_inside,table,table,id,3,2,1,0,1,1,0,1,
+nul.u06_fix_nulls,table,table,id,4,4,0,0,2,0,0,2,
+nul.u06_fix_nulls_three,table,table,id,2,2,0,0,2,0,0,2,
+nul.u07_comp_key,table,table,"k1, k2",7,4,3,0,3,3,0,3,
+num.n01_scale,table,table,id,2,2,0,0,1,0,0,0,
+num.n02_key_scale,table,table,id,4,4,3,3,0,1,1,0,
+num.n02_key_scale_comp,table,table,"k1, k2",4,4,3,3,0,1,1,0,
+num.n03_repair_scale,table,table,id,4,2,2,0,1,2,0,0,
+num.n04_numeric_nan,table,table,id,3,2,1,0,1,1,0,1,
+num.n05_numeric_inf,table,table,id,5,4,1,0,2,1,0,2,
+num.n06_key_nan,table,table,id,5,3,2,0,1,2,0,1,
+num.n07_float_key,table,table,id,4,2,2,0,1,2,0,1,
+num.n07_float_special,table,table,id,4,3,1,0,2,1,0,2,
+num.n08_float_zero_key,table,table,id,2,2,1,1,0,0,0,0,
+num.n09_float_last_bit,table,table,id,3,3,0,0,2,0,0,2,
+num.n10_bigint_key,table,table,id,4,3,1,0,2,1,0,2,
+num.n10_numeric_key_big,table,table,id,3,2,1,0,1,1,0,1,
+num.n11_numeric_named,table,table,id,2,2,0,0,1,0,0,1,
+num.n12_float4_float8,table,table,id,3,3,0,0,1,0,0,1,type of v differs: real / double precision
+num.n13_nan_equal,table,table,id,2,2,0,0,0,0,0,0,
+num.n14_numeric_extreme,table,table,id,5,5,0,0,2,0,0,2,
+num.n15_inside,table,table,id,2,2,0,0,1,0,0,0,no operator = for the column p
+rep.r02_stale,table,table,id,6,5,2,1,3,2,1,3,
+rep.r03_constraints,table,table,id,5,2,4,1,0,4,1,0,
+rep.r04_three_nodes,table,table,id,2,3,0,1,1,0,1,1,
+rep.r05_child,table,table,id,2,2,0,0,2,0,0,0,
+rep.r05_parent,table,table,id,1,1,1,1,0,0,0,0,
+rep.r07_text_keys,table,table,id,13,13,0,0,12,0,0,12,
+rep.r08_coalesce,table,table,id,3,3,0,0,3,0,0,3,
+rep.r09_unique_swap,table,table,id,6,6,0,0,5,0,0,5,
+rep.r10_child,table,table,id,2,2,1,1,0,1,1,0,
+rep.r10_parent,table,table,id,2,2,1,1,0,1,1,0,
+rep.r10_tree,table,table,id,4,1,3,0,0,3,0,0,
+rep.r11_exclusion,table,table,id,3,3,0,0,2,0,0,2,
+rep.r12_part,partitioned table,partitioned table,"id, region",3,1,2,0,0,2,0,0,
+str.s01_child,table,table,id,1,2,0,1,0,0,1,0,
+str.s01_parent,table,table,id,3,3,0,0,0,0,0,0,
+str.s02_child,table,table,id,1,0,1,0,0,1,0,0,
+str.s02_parent,table,table,,3,2,1,0,,,,,the key (id) is not unique on one node: whole rows are compared as a set with counts
+str.s03_part,partitioned table,partitioned table,id,2500,2498,2,0,3,2,0,3,
+str.s04_part_bounds,partitioned table,partitioned table,id,199,199,0,0,0,0,0,0,
+str.s04_part_one_side,partitioned table,table,id,100,100,0,0,0,0,0,0,
+str.s05_foreign_only,foreign table,foreign table,,2,2,1,1,,,,,no common primary key: whole rows are compared as a set with counts
+str.s05_parent,table,table,id,4,4,0,0,2,0,0,2,
+str.s05_remote,table,table,id,2,2,0,0,1,0,0,1,
+str.s06_child_nopk,table,table,,2,3,1,2,,,,,no common primary key: whole rows are compared as a set with counts
+str.s06_parent,table,table,,3,4,1,2,,,,,the key (id) is not unique on one node: whole rows are compared as a set with counts
+str.s07_key_only,table,table,id,3,3,1,1,0,1,1,0,
+str.s07_key_only_comp,table,table,"a, b",3,3,1,1,0,1,1,0,
+str.s07_wide_1600,table,table,id,5,4,1,0,1,,,,operator rule not computed: number of columns (3200) exceeds limit (1664)
+str.s08_rls,table,table,id,4,4,0,0,0,0,0,0,
+str.s09_col_priv,table,table,id,2,2,0,0,0,0,0,0,
+str.s10_rule,table,table,id,2,1,1,0,0,1,0,0,
+str.s11_row_filter,table,table,id,300,100,200,0,0,200,0,0,
+str.s12_col_filter,table,table,id,100,100,0,0,100,0,0,100,
+str.s13_counter,table,table,id,3,3,0,0,2,0,0,2,
+str.s14_volatile_default,table,table,id,20000,20000,0,0,20000,0,0,20000,
+str.s15_trigger_always,table,table,id,3,2,1,0,1,1,0,1,
+str.s15_trigger_plain,table,table,id,3,2,1,0,1,1,0,1,
+txt.x01_bool_key,table,table,id,2,1,1,0,1,1,0,1,
+txt.x01_inet_key,table,table,id,4,3,1,0,1,1,0,1,
+txt.x01_text_cast,table,table,id,3,2,1,0,1,1,0,1,
+txt.x02_session,table,table,id,2,2,0,0,0,0,0,0,
+txt.x03_encoding,table,table,id,5,5,0,0,0,0,0,0,
+txt.x05_datetime,table,table,id,5,4,1,0,2,1,0,2,
+txt.x06_money,table,table,id,3,2,1,0,1,1,0,1,
+txt.x07_markers,table,table,id,20,13,7,0,9,7,0,9,
+txt.x08_special_chars,table,table,id,21,11,10,0,10,10,0,10,
+txt.x08_special_keys,table,table,id,21,11,10,0,10,10,0,10,
+txt.x10_encoding_target,table,table,id,4,4,0,0,0,0,0,0,
+txt.x12_old_dates,table,table,id,5,5,0,0,2,0,0,2,
+typ.t01_key_typmod_numeric,table,table,id,3,2,1,0,1,1,0,1,"type of id differs: numeric(7,2) / numeric(5,2)"
+typ.t02_key_typmod_varchar,table,table,id,3,2,1,0,1,1,0,1,type of id differs: character varying(10) / character varying(3)
+typ.t03_value_typmod,table,table,id,3,3,0,0,3,0,0,2,"type of s differs: character varying(20) / character varying(5); type of n differs: numeric(12,3) / numeric(10,2)"
+typ.t04_key_bit,table,table,id,4,3,1,0,1,1,0,1,
+typ.t04_key_char,table,table,id,4,3,1,0,1,1,0,1,
+typ.t05_nonkey_typmod,table,table,id,2,2,0,0,0,0,0,0,"type of amount differs: numeric(12,2) / numeric(10,2); type of code differs: character varying(20) / character varying(10)"
+typ.t06_key_int4_int8,table,table,id,2,3,0,1,1,0,1,1,type of id differs: integer / bigint
+typ.t07_bpchar_varchar,table,table,id,1,1,0,0,1,0,0,0,type of v differs: character(5) / character varying(10)
+typ.t07_date_ts,table,table,id,1,1,0,0,1,0,0,0,type of v differs: date / timestamp without time zone
+typ.t07_int8_int4,table,table,id,1,1,0,0,0,0,0,0,type of v differs: bigint / integer
+typ.t07_jsonb_json,table,table,id,1,1,0,0,1,0,0,0,type of v differs: jsonb / json; no operator = for the column v
+typ.t07_numeric_float8,table,table,id,2,2,0,0,1,0,0,0,type of v differs: numeric / double precision
+typ.t07_text_varchar,table,table,id,1,1,0,0,0,0,0,0,type of v differs: text / character varying(64)
+typ.t07_ts3_ts6,table,table,id,1,1,0,0,0,0,0,0,type of v differs: timestamp(3) without time zone / timestamp(6) without time zone
+typ.t07_tstz_ts,table,table,id,1,1,0,0,1,0,0,0,type of v differs: timestamp with time zone / timestamp without time zone
+typ.t08_user_types,table,table,id,2,2,0,0,0,0,0,0,
+typ.t09_composite_attnum,table,table,id,2,2,0,0,0,0,0,0,
+typ.t09_dropped_col,table,table,id,2,2,0,0,0,0,0,0,
+typ.t10_domain_check,table,table,id,3,1,2,0,0,2,0,0,
+typ.t10_enum_extra,table,table,id,3,1,2,0,0,2,0,0,
+typ.t11_col_order,table,table,id,3,3,0,0,0,0,0,0,column order differs
+typ.t12_extra_col,table,table,id,2,2,0,0,0,0,0,0,column c only on n1
+typ.t13_not_null,table,table,id,3,1,2,0,0,2,0,0,
+typ.t14_enum_order,table,table,"e, n",3000,3000,0,0,3,0,0,3,
+typ.t15_generated,table,table,id,3,2,1,0,2,1,0,2,
+typ.t16_virtual,table,table,id,3,2,1,0,2,1,0,2,
+typ.t17_identity_always,table,table,id,4,2,2,0,1,2,0,1,
+typ.t18_serial,table,table,id,10,5,5,0,0,5,0,0,
+typ.t19_bit,table,table,id,2,1,1,0,1,1,0,1,type of b differs: bit(8) / bit(16)
+typ.t19_vector,table,table,id,2,1,1,0,1,1,0,1,type of v differs: vector(3) / vector(4)
+ver.v01_block_error,table,table,id,,,,,,,,,read error on n2: division by zero
+ver.v04_long_value,table,table,id,3,3,0,0,3,0,0,3,
+ver.v05_swap,table,table,id,4,4,0,0,2,0,0,2,
+ver.v06_text_collisions,table,table,id,4,3,1,0,3,1,0,3,

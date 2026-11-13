@@ -1,0 +1,39 @@
+-- Case P15: the restored side has lost the commit timestamps.
+-- Stand: both servers with track_commit_timestamp = on. Node 1 plays the old
+--        database, node 2 plays its copy made by dump and restore.
+-- Run:   node 1 and node 2 scripts in the two databases.
+-- Expect: on node 1 the rows keep their real commit times (2025 and 2026; the
+--         script sets them through a replication origin). On node 2 every row
+--         was "committed" at the time of the restore, that is now.
+--   row 1: equal.
+--   row 2: node 1 holds the newer version (updated_at 2026-06-01), node 2 the
+--          older one. By commit time node 2 looks fresher: pick_freshest
+--          chooses the old data. A tool should warn when all rows of one side
+--          have nearly the same commit time.
+--   row 3: only on node 1; a stale check by commit time treats node 2 as fresh.
+DO $$
+BEGIN
+	IF current_setting('track_commit_timestamp') <> 'on' THEN
+		RAISE EXCEPTION 'this case needs track_commit_timestamp = on';
+	END IF;
+	IF NOT EXISTS (SELECT FROM pg_replication_origin WHERE roname = 'ace_ref_history') THEN
+		PERFORM pg_replication_origin_create('ace_ref_history');
+	END IF;
+END $$;
+DROP TABLE IF EXISTS sp.p15_restored;
+CREATE TABLE sp.p15_restored (id int PRIMARY KEY, v text, updated_at timestamptz);
+\if :n1
+DO $$ BEGIN
+	PERFORM pg_replication_origin_session_setup('ace_ref_history');
+	PERFORM pg_replication_origin_xact_setup('0/1', '2025-03-01 00:00:00+00');
+	INSERT INTO sp.p15_restored VALUES (1, 'never changed', '2025-03-01 00:00:00+00'), (3, 'lost by the restore', '2025-03-01 00:00:00+00');
+END $$;
+DO $$ BEGIN
+	PERFORM pg_replication_origin_xact_setup('0/2', '2026-06-01 00:00:00+00');
+	INSERT INTO sp.p15_restored VALUES (2, 'new version', '2026-06-01 00:00:00+00');
+END $$;
+DO $$ BEGIN PERFORM pg_replication_origin_session_reset(); END $$;
+\else
+INSERT INTO sp.p15_restored VALUES (1, 'never changed', '2025-03-01 00:00:00+00'), (2, 'old version', '2026-01-01 00:00:00+00');
+\endif
+COMMENT ON TABLE sp.p15_restored IS 'P15: row 2 changed (node 1 is newer by updated_at, node 2 by commit time), row 3 only on node 1';

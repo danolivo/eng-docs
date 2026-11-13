@@ -1,0 +1,22 @@
+-- Case P8: reg* columns under pg_upgrade.
+-- Stand: an old cluster that is going to be upgraded with pg_upgrade. Only
+--        node 1 (the old cluster) matters; the node 2 script is the same and
+--        is there for a dump and restore, where all these columns survive as
+--        names.
+-- Run:   this script in a database of the old cluster, then
+--          pg_upgrade --check -b <old bin> -B <new bin> -d <old data> -D <new data>
+-- Expect: pg_upgrade refuses sp.p08_reg_refused ("reg* data types in user
+--         tables") and accepts sp.p08_reg_allowed. So after a real upgrade a
+--         table of the first kind cannot exist: nothing to compare. After a
+--         dump and restore both tables exist on the new side and must match by
+--         name, although the OIDs behind the names differ.
+DROP TABLE IF EXISTS sp.p08_reg_refused, sp.p08_reg_allowed;
+CREATE TABLE sp.p08_reg_refused (id int PRIMARY KEY, rp regproc, rpr regprocedure, ro regoper, ror regoperator, rcfg regconfig, rdict regdictionary, rns regnamespace, rcoll regcollation);
+INSERT INTO sp.p08_reg_refused VALUES
+	(1, 'now', 'abs(integer)', '||/', '+(integer,integer)', 'english', 'simple', 'pg_catalog', '"C"'),
+	(2, 'version', 'length(text)', '|/', '=(text,text)', 'simple', 'english_stem', 'public', '"POSIX"');
+COMMENT ON TABLE sp.p08_reg_refused IS 'P8: pg_upgrade --check refuses this table; after a dump and restore it matches by name';
+
+CREATE TABLE sp.p08_reg_allowed (id int PRIMARY KEY, rc regclass, rt regtype, rr regrole);
+INSERT INTO sp.p08_reg_allowed VALUES (1, 'sp.p08_reg_refused', 'integer', current_user::regrole), (2, 'pg_class', 'text[]', 'pg_monitor');
+COMMENT ON TABLE sp.p08_reg_allowed IS 'P8: pg_upgrade accepts this table; match by name';
