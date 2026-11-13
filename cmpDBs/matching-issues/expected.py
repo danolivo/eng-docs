@@ -85,8 +85,12 @@ SELECT json_build_object('tbl', r.tbl, 'kind', c.relkind,
 
 
 def read_rows(db, tbl, cols):
-    """All rows as tuples of texts (None for NULL), by the text rule."""
-    items = ', '.join('CASE WHEN %s IS NULL THEN NULL ELSE format(\'%%s\', %s) END' % (q(c), q(c)) for c in cols)
+    """All rows as tuples of texts (None for NULL), by the text rule.
+
+    num_nulls() tests the value itself: "IS NULL" is also true for a
+    composite value whose fields are all NULL, such as (,).
+    """
+    items = ', '.join('CASE WHEN num_nulls(%s) = 1 THEN NULL ELSE format(\'%%s\', %s) END' % (q(c), q(c)) for c in cols)
     out, err = psql(db, 'SELECT array_to_json(ARRAY[%s]::text[]) FROM %s;' % (items, tbl))
     return [tuple(json.loads(line)) for line in out], err
 

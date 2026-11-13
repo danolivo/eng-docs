@@ -28,7 +28,7 @@ Prepare the stand of a group once, then run the pairs of the group.
 |---|---|---|
 | Any two databases, heavy load | Enough resources: see the note of each case. | D7 (`d07_big_block`), X9 (`x09_big_values`), V2 (`v02_mass_diff`) |
 | Commit timestamps | `track_commit_timestamp = on` on both servers, then a restart. No real replication is needed: the scripts set commit times and origins through the replication origins `ace_ref_peer` and `ace_ref_history`. The scripts stop at once if the setting is off. | R6 (`r06_commit_ts`), P15 (`p15_commit_ts_lost`) |
-| SQL_ASCII database | `createdb -E SQL_ASCII -l C -T template0 <name>` for node 2; node 1 is a UTF8 database. | X11 (`x11_sql_ascii`) |
+| SQL_ASCII database | `createdb -T template0 -E SQL_ASCII --locale-provider=libc -l C <name>` for node 2; node 1 is a UTF8 database. | X11 (`x11_sql_ascii`) |
 | Scratch database, superuser | A database that can be dropped after the test. | K17 (`k17_broken_index`), R13 (`r13_read_only`) |
 | Native logical replication | `wal_level = logical` on the publisher, then a restart. The two databases can be in one instance. | R14 (`r14_logical_replication`) |
 | Extension | The extension is installed on both servers. | D10 (`d10_postgis`), S16 (`s16_timescaledb`, needs `shared_preload_libraries`) |
@@ -37,7 +37,7 @@ Prepare the stand of a group once, then run the pairs of the group.
 | Two collation versions | Two OS releases with different glibc or ICU versions, or two clusters made by `initdb` with different locale options. | P13 (`p13_collation`) |
 | Upgrade | An old cluster and a new cluster of a newer major version, and `pg_upgrade`. | P1, P2, P3 (`p01_upgrade`), P8 (`p08_reg_types`) |
 | Dump and restore | Node 2 does not exist before the test: it is made from a dump of node 1. | P18 (`p18_travel`) |
-| Tool state between two steps | A tool that keeps its own state about a table (in ACE: a Merkle tree). | V3 (`v03_update_conflict`, `v03_update_conflict_step`), V2, P18 |
+| Tool state between two steps | A tool that keeps its own state about a table (in ACE: a Merkle tree). For ACE each node must be in its own instance: `mtree` uses a replication slot with a fixed name, and such a name is unique in an instance, not in a database. | V3 (`v03_update_conflict`, `v03_update_conflict_step`), V2, P18 |
 
 Notes for single cases:
 
@@ -50,7 +50,7 @@ Notes for single cases:
 | R13 | The node 2 script makes its database read-only for new sessions. `r13_read_only_undo.sql` makes it writable again. |
 | R14 | Node 1 is the publisher, node 2 the subscriber. Edit the connection string in the node 2 script (one marked line) before the run. To run the case again: `r14_logical_replication_undo.sql` on node 2, then the node 1 script, then the node 2 script. |
 | P1 | Use `pg_upgrade --copy` or `--clone`. With `--link` the old cluster cannot be started again, so there is nothing to compare with. |
-| P2, P3 | No script of their own: they are the main set on plain servers. P2 is any instance with `track_commit_timestamp = off` (the default). P3 is a comparison of every table of the database, where tables without a key, foreign tables and views must be listed as not compared. |
+| P2, P3 | No script of their own: they are the main set on plain servers. P2 is any instance with `track_commit_timestamp = off` (the default). P3 is a comparison of every table of the database, where tables without a key, foreign tables and views must be listed as not compared. ACE compares a whole schema (`schema-diff`) only when the database has the same name on every node, so its nodes must be in different instances. |
 | P8 | Only node 1 matters: `pg_upgrade --check` must refuse one of its tables. |
 | V3 | Run the step pair in a way that is not replicated between the nodes. |
 
@@ -67,12 +67,22 @@ Two cases of this kind have their tables in the main set: V1 (`ver.v01_block_err
 
 ## State of the scripts
 
-The scripts were run on PostgreSQL 18.6 with `track_commit_timestamp = on` and `wal_level = logical`. No comparison tool was run on them.
+Every pair was run in full on PostgreSQL 18.6 and 18.7 with `track_commit_timestamp = on` and `wal_level = logical`. The extensions were PostGIS 3.7.0 and TimescaleDB 2.32.0. The steps of a comparison tool are not a part of this state.
 
-- Run in full, two times each: `x04_versions`, `n16_float_text`, `p13_collation`, `p17_ext_versions`, `p08_reg_types`, `k17_broken_index`, `r06_commit_ts`, `p15_commit_ts_lost`, `r13_read_only`, `r14_logical_replication`, `x11_sql_ascii`, `v03_update_conflict`, `p18_travel`, `p01_upgrade`. They ran on one server, so the differences that need two server versions or two OS releases were not seen. `p01_upgrade` ran with a dump and restore in place of the upgrade. The steps of a tool (`mtree`) were not run.
-- Seen in these runs. K17: for the same key range an index scan gives 2132 rows and a sequential scan 2827; there are 2352 duplicate keys; `bt_index_check` reports the index; a dump of that database cannot restore the primary key. R6 and P15: the rows have the planned commit times and origins. R13: an INSERT is refused. R14: an INSERT of row 3 on the publisher makes the apply worker of the subscriber fail (`apply_error_count = 1`).
-- Run only with smaller sizes: `d07_big_block`, `x09_big_values`, `v02_mass_diff`.
-- Not run: `d10_postgis`, `s16_timescaledb`. The extensions were not installed.
+- Two server versions. `x04_versions` and `p17_ext_versions`: version 15 against 18. `n16_float_text`: version 11 against 18. `p01_upgrade`: `pg_upgrade --copy` from version 15 to 18.
+- Two OS releases. `p13_collation`: version 15 on Ubuntu 18.04 (glibc 2.27, ICU 60) against version 15 on Debian 12 (glibc 2.36, ICU 72).
+- Heavy pairs. `d07_big_block`, `x09_big_values` and `v02_mass_diff` were loaded in full size on servers with 16 GB of memory.
+- Seen in these runs:
+  - K17: for the same key range an index scan gives 2132 rows and a sequential scan 2827; there are 2352 duplicate keys; `bt_index_check` reports the index; a dump of that database cannot restore the primary key.
+  - R6 and P15: the rows have the planned commit times and origins.
+  - R13: an INSERT is refused.
+  - R14: an INSERT of row 3 on the publisher makes the apply worker of the subscriber fail (`apply_error_count = 1`).
+  - D10: the rows differ as the head of the script says; `ST_Equals` is true for the two lines of row 2.
+  - S16: 30 chunks on node 1 and 5 on node 2; no row is in the root table.
+  - X4: with the same ICU locale on both servers only row 21 of `sp.x04_version_canary` differs; `sp.x04_new_values` has 2 rows only on the newer server.
+  - P17: the versions of citext (1.6 / 1.8) and ltree (1.2 / 1.3) differ; the values of `sp.p17_ext_values` are equal.
+  - N16: with `extra_float_digits = 3` 7 of 10 rows differ by text.
+  - P13: with the glibc locale `en_US.UTF-8` 10 of 42 strings have another position in the sort order, and `sp.p13_text_key` holds the same rows. With the ICU locale `en-US` no string of this sample has another position.
 - R6: on PostgreSQL 18 a frozen row still shows its commit time. A NULL commit time of a frozen row was not reproduced.
 
 ## Changing the cases

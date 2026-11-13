@@ -2,8 +2,7 @@
 -- Usage:  psql -X -q -v ON_ERROR_STOP=1 -d <database> -f d10_postgis_node1.sql
 --
 -- Case D10: PostGIS geometry and geography.
--- Stand: two databases on servers with PostGIS. This script was not run: no
---        PostGIS on the server where the other scripts were checked.
+-- Stand: two databases on servers with PostGIS.
 -- Run:   node 1 and node 2 scripts.
 -- Expect (the text of a geometry is its hex EWKB):
 --   row 0: equal.

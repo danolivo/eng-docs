@@ -1,6 +1,6 @@
 -- Case X11: a node whose database has the SQL_ASCII encoding.
 -- Stand: node 1 is a UTF8 database; node 2 is a database made with
---          createdb -E SQL_ASCII -l C -T template0 <name>
+--          createdb -T template0 -E SQL_ASCII --locale-provider=libc -l C <name>
 -- Run:   node 1 script in the UTF8 database, node 2 script in the SQL_ASCII one.
 -- Expect: rows 1, 2 equal (row 2 holds the UTF-8 bytes of the same text).
 --         Row 3 holds a LATIN1 byte on node 2: the server does no conversion

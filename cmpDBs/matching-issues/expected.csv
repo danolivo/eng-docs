@@ -35,7 +35,7 @@ eqv.e09_bpchar_key,table,table,id,2,2,1,1,0,0,0,0,
 eqv.e10_range,table,table,id,2,2,0,0,1,0,0,0,
 eqv.e11_array_bounds,table,table,id,3,2,1,0,1,1,0,1,
 eqv.e12_array_nulls,table,table,id,8,8,0,0,4,0,0,4,
-eqv.e13_row_nulls,table,table,id,4,4,0,0,1,0,0,2,
+eqv.e13_row_nulls,table,table,id,4,4,0,0,2,0,0,2,
 eqv.e14_json,table,table,id,4,4,0,0,3,0,0,0,no operator = for the column j
 eqv.e15_time,table,table,id,2,2,0,0,1,0,0,1,
 eqv.e16_interval_key,table,table,id,3,2,2,1,0,1,0,0,

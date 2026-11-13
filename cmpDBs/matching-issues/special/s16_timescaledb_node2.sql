@@ -3,8 +3,8 @@
 --
 -- Case S16: a TimescaleDB hypertable whose chunks were made on each node by
 -- itself.
--- Stand: two databases on servers with TimescaleDB. This script was not run: no
---        TimescaleDB on the server where the other scripts were checked.
+-- Stand: two databases on servers with TimescaleDB (the library is in
+--        shared_preload_libraries).
 -- Run:   node 1 and node 2 scripts.
 -- Expect: the hypertable holds the same 2160 rows but 3 changed and 2 only on
 --         node 1 (see below). Its chunks cover 1 day on node 1 and 7 days on

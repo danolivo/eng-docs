@@ -69,7 +69,7 @@ psql -X -q -v ON_ERROR_STOP=1 -d n2 -f node2.sql
 For the third node, only when its cases are tested:
 
 ```
-createdb -T template0 -E LATIN1 -l C n3
+createdb -T template0 -E LATIN1 --locale-provider=libc -l C n3
 psql -X -q -v ON_ERROR_STOP=1 -d n3 -f node3.sql
 ```
 

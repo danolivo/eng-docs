@@ -26,8 +26,12 @@ CREATE TABLE sp.x09_big_bytea (id int PRIMARY KEY, b bytea);
 CREATE TABLE sp.x09_wide_row (id int PRIMARY KEY, a text, b text, c text);
 INSERT INTO sp.x09_big_bytea VALUES (2, '\x00ff'), (3, '\x01');
 INSERT INTO sp.x09_wide_row VALUES (2, 'a', 'b', 'c'), (3, 'a', 'b', 'c');
+-- The wide row is filled one field for each statement: a statement that
+-- holds all three values at once needs a row of 1.2 GB in memory and fails.
+INSERT INTO sp.x09_wide_row VALUES (1, repeat('a', 419430400), NULL, NULL);
+UPDATE sp.x09_wide_row SET b = repeat('b', 419430400) WHERE id = 1;
 INSERT INTO sp.x09_big_bytea SELECT 1, convert_to(repeat('x', 629145600), 'UTF8') || '\x02'::bytea;
-INSERT INTO sp.x09_wide_row SELECT 1, repeat('a', 419430400), repeat('b', 419430400), repeat('c', 419430399) || '2';
+UPDATE sp.x09_wide_row SET c = repeat('c', 419430399) || '2' WHERE id = 1;
 UPDATE sp.x09_big_bytea SET b = '\x02' WHERE id = 3;
 UPDATE sp.x09_wide_row SET c = 'changed' WHERE id = 3;
 COMMENT ON TABLE sp.x09_big_bytea IS 'X9: row 1 = 600 MB of bytea, the last byte differs; row 3 changed; row 2 equal';

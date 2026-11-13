@@ -100,7 +100,7 @@ Each case is one situation where a comparison of two tables can give a wrong ans
 | **E10** ranges with numeric bounds | `eqv.e10_range` | row 1 changed by text, equal by = | 0 / 0 / 1 | 0 / 0 / 0 |  |
 | **E11** array lower bounds | `eqv.e11_array_bounds` | row 1 changed (lower bound 0 / 1), row 2 only on n1; after repair the text on n2 keeps the [0:2]= and [5:6]= prefix; row 0 equal | 1 / 0 / 1 |  |  |
 | **E12** empty array, NULL array, NULL elements | `eqv.e12_array_nulls` | rows 1-4 changed; rows 0, 10, 11, 12 equal; after repair every text is kept | 0 / 0 / 4 |  |  |
-| **E13** a composite of NULLs against NULL | `eqv.e13_row_nulls` | row 1 changed: (,) / NULL, although both are "IS NULL"; row 2 changed: (1,) / (1,"") | 0 / 0 / 1 | 0 / 0 / 2 |  |
+| **E13** a composite of NULLs against NULL | `eqv.e13_row_nulls` | row 1 changed: (,) / NULL, although both are "IS NULL"; row 2 changed: (1,) / (1,"") | 0 / 0 / 2 |  |  |
 | **E14** json keeps the text as typed | `eqv.e14_json` | rows 1-3 changed by text (duplicate key, a space, key order); json has no equality operator | 0 / 0 / 3 | 0 / 0 / 0 | no operator = for the column j |
 | **E15** time edge values | `eqv.e15_time` | row 1 equal (23:59:60 is stored as 24:00:00); row 2 changed (24:00:00 / 00:00:00) | 0 / 0 / 1 |  |  |
 | **E16** interval as a key | `eqv.e16_interval_key` | key "1 day" only on n1, key "24:00:00" only on n2 (equal by =); key infinity only on n1 | 2 / 1 / 0 | 1 / 0 / 0 |  |
@@ -362,7 +362,7 @@ Expect: sp.x09_big_bytea: row 1 holds 600 MB of bytea; its hex text would be
 ```
 Case X11: a node whose database has the SQL_ASCII encoding.
 Stand: node 1 is a UTF8 database; node 2 is a database made with
-         createdb -E SQL_ASCII -l C -T template0 <name>
+         createdb -T template0 -E SQL_ASCII --locale-provider=libc -l C <name>
 Run:   node 1 script in the UTF8 database, node 2 script in the SQL_ASCII one.
 Expect: rows 1, 2 equal (row 2 holds the UTF-8 bytes of the same text).
         Row 3 holds a LATIN1 byte on node 2: the server does no conversion
@@ -411,8 +411,7 @@ Expect: rows 1, 150000 and 300000 changed. No "out of memory" (SQLSTATE
 
 ```
 Case D10: PostGIS geometry and geography.
-Stand: two databases on servers with PostGIS. This script was not run: no
-       PostGIS on the server where the other scripts were checked.
+Stand: two databases on servers with PostGIS.
 Run:   node 1 and node 2 scripts.
 Expect (the text of a geometry is its hex EWKB):
   row 0: equal.
@@ -431,8 +430,8 @@ Expect (the text of a geometry is its hex EWKB):
 ```
 Case S16: a TimescaleDB hypertable whose chunks were made on each node by
 itself.
-Stand: two databases on servers with TimescaleDB. This script was not run: no
-       TimescaleDB on the server where the other scripts were checked.
+Stand: two databases on servers with TimescaleDB (the library is in
+       shared_preload_libraries).
 Run:   node 1 and node 2 scripts.
 Expect: the hypertable holds the same 2160 rows but 3 changed and 2 only on
         node 1 (see below). Its chunks cover 1 day on node 1 and 7 days on
