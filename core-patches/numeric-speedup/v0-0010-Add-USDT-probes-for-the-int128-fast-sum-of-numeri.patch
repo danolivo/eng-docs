@@ -1,0 +1,252 @@
+From f8680e26401c77fc239cc6639f7fd2b4f0ab0c80 Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Sat, 14 Nov 2026 15:50:59 +0100
+Subject: [PATCH v0 10/10] Add USDT probes for the int128 fast sum of numeric
+ aggregates
+
+The int128 representation of sum(numeric) and avg(numeric) states pays off
+only while states stay in it.  How often they leave it depends on the data
+and on the plan, and on a real workload there was no way to see it short of
+a debugger.
+
+Add two probes.  numeric-agg-fast-start() fires when the first transition
+state of a plan node is created in the int128 representation: once per
+transition state of the node and process, not once per group, so that a
+hash aggregate over millions of groups does not fire it millions of times.
+Aggregates that share a transition state, such as sum(x) and avg(x) over
+the same input, are reported once.  A non-NULL fn_extra of the transition
+function marks the state as reported; it lives as long as the FmgrInfo, so
+rescans and spilled batches do not report it again.  States built by
+combine and deserialization functions are not reported: they carry on
+partial states that started elsewhere, and in a parallel plan each worker
+reports its own.
+
+numeric-agg-promote(int cause, long n) fires when a state moves to the
+digit-array accumulator.  cause is
+
+  1  transition: the input value or the running sum does not fit
+  2  inverse transition of a moving aggregate
+  3  combine: two int128 partial sums whose total does not fit
+  4  combine: an int128 state meets one that has already moved
+
+n is the state's input count at that moment.  With cause 1 it excludes the
+value being added, so zero means that the group's first input did not fit;
+with cause 2 it still includes the value being removed; with causes 3 and 4
+it already includes the other partial state's inputs.  Causes 3 and 4 are
+reported by the process that combines, which in a parallel plan is the
+leader.
+
+Promotions are counted per state, so one numeric-agg-fast-start may be
+followed by many numeric-agg-promote events, one for each group that left
+the fast path.  A state recreated for a spilled hash batch or a restarted
+window frame is counted again if it is promoted again, as it pays the cost
+again.
+
+Both probes are guarded by their _ENABLED() macros, so that a tracer sees
+either both of them or neither, and fn_extra is touched only while the
+start probe is active.  The tracing tool must therefore activate USDT
+semaphores, as bpftrace and SystemTap do when they attach.  Without
+--enable-dtrace the probes and their guards compile to nothing.  Document
+them in the probe table in monitoring.sgml.
+---
+ doc/src/sgml/monitoring.sgml     | 34 ++++++++++++++++++
+ src/backend/utils/adt/numeric.c  | 62 +++++++++++++++++++++++++++++---
+ src/backend/utils/probes.d       |  3 ++
+ src/tools/pgindent/typedefs.list |  1 +
+ 4 files changed, 95 insertions(+), 5 deletions(-)
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 7c706ecfdda..5107168f847 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -8361,6 +8361,40 @@ FROM pg_stat_get_backend_idset() AS backendid;
+      <entry>Probe that fires when a deadlock is found by the deadlock
+       detector.</entry>
+     </row>
++    <row>
++     <entry><literal>numeric-agg-fast-start</literal></entry>
++     <entry><literal>()</literal></entry>
++     <entry>Probe that fires when <function>sum(numeric)</function> or
++      <function>avg(numeric)</function> creates its first transition state
++      that accumulates in the 128-bit integer representation.  It fires once
++      per transition state of a plan node, in each process that runs it, not
++      once per group, and not again on rescans; aggregates that share a
++      transition state, such as <literal>sum(x)</literal> and
++      <literal>avg(x)</literal> over the same input, are reported once.
++      In a parallel plan each worker reports its own partial aggregation.
++      States built by combine or deserialization functions are not reported.
++      Like <literal>numeric-agg-promote</literal>, this probe fires only
++      while the tracing tool has activated its semaphore.</entry>
++    </row>
++    <row>
++     <entry><literal>numeric-agg-promote</literal></entry>
++     <entry><literal>(int, long)</literal></entry>
++     <entry>Probe that fires when such a state switches to the arbitrary
++      precision representation because its sum no longer fits.
++      arg0 is the cause: 1 for a transition (an input value or the running
++      sum does not fit), 2 for the inverse transition of a moving aggregate,
++      3 when two partial sums are combined and their total does not fit,
++      4 when a partial state is combined with one that has already switched.
++      Causes 3 and 4 are reported by the process that combines the partial
++      states, which in a parallel plan is the leader.
++      arg1 is the state's number of input values at that moment: with
++      cause 1 it excludes the value being added, so 0 means the first input
++      value did not fit; with cause 2 it still includes the value being
++      removed; with causes 3 and 4 it already includes the inputs of the
++      other partial state.
++      This probe fires only while the tracing tool has activated its
++      semaphore.</entry>
++    </row>
+ 
+    </tbody>
+    </tgroup>
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index e496db937a0..98e2ffdd375 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -36,6 +36,7 @@
+ #include "nodes/nodeFuncs.h"
+ #include "nodes/supportnodes.h"
+ #include "optimizer/optimizer.h"
++#include "pg_trace.h"
+ #include "utils/array.h"
+ #include "utils/builtins.h"
+ #include "utils/float.h"
+@@ -5444,6 +5445,33 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
+ 
+ 	MemoryContextSwitchTo(old_context);
+ 
++	/*
++	 * Report that the fast path has been entered, once per transition
++	 * function call site -- that is, per transition state of a plan node, in
++	 * each process that runs it -- rather than once per group: a hash
++	 * aggregate over many groups would otherwise fire the probe for every
++	 * group.  Aggregates that share a transition state, such as sum(x) and
++	 * avg(x) over the same input, share the transition function's FmgrInfo
++	 * and are reported once.  A non-NULL fn_extra marks it as reported; it
++	 * lives as long as the FmgrInfo, so rescans and spilled batches do not
++	 * report it again.  Only transition states are considered: the states
++	 * built by combine and deserialization functions come from
++	 * makeNumericAggStateCurrentContext() and merely carry on partial states
++	 * that started elsewhere.
++	 *
++	 * The _ENABLED() test is constant false without --enable-dtrace, and with
++	 * it is true only while a tracer has activated the probe, so fn_extra is
++	 * left alone in every other case.  numeric-agg-promote is guarded the
++	 * same way, so that a tracer sees either both probes or neither.
++	 */
++	if (TRACE_POSTGRESQL_NUMERIC_AGG_FAST_START_ENABLED() &&
++		!state->promoted && fcinfo->flinfo->fn_extra == NULL)
++	{
++		TRACE_POSTGRESQL_NUMERIC_AGG_FAST_START();
++		fcinfo->flinfo->fn_extra =
++			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, 1);
++	}
++
+ 	return state;
+ }
+ 
+@@ -5469,16 +5497,33 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
+ 	return state;
+ }
+ 
++/*
++ * Why a state left the fast path, as reported by the numeric-agg-promote
++ * probe.  The probe's second argument is the state's input count at the
++ * moment of promotion.  For NUMERIC_AGG_PROMOTE_ACCUM it excludes the input
++ * being added, so zero means that the group's very first input did not fit;
++ * for NUMERIC_AGG_PROMOTE_DISCARD it still includes the input being removed;
++ * for the two combine causes it already includes the other partial state's
++ * inputs.
++ */
++typedef enum NumericAggPromoteCause
++{
++	NUMERIC_AGG_PROMOTE_ACCUM = 1,	/* transition: input or sum does not fit */
++	NUMERIC_AGG_PROMOTE_DISCARD = 2,	/* moving-aggregate inverse transition */
++	NUMERIC_AGG_PROMOTE_COMBINE_OVERFLOW = 3,	/* two fast partial sums */
++	NUMERIC_AGG_PROMOTE_COMBINE_MIXED = 4,	/* fast state meets a promoted one */
++} NumericAggPromoteCause;
++
+ /*
+  * Convert the accumulated int128 fast sum into the digit-array accumulator
+  * and switch the state to the (permanent) promoted mode; see NumericAggState.
+  *
+  * This only moves the sum itself: an input that failed to be accumulated the
+  * fast way must afterwards be processed by the regular digit-array path,
+- * including its N++.
++ * including its N++.  'cause' is only reported to the tracing probe.
+  */
+ static void
+-promote_numeric_agg_state(NumericAggState *state)
++promote_numeric_agg_state(NumericAggState *state, NumericAggPromoteCause cause)
+ {
+ 	NumericVar	tmp;
+ 	MemoryContext old_context;
+@@ -5486,6 +5531,10 @@ promote_numeric_agg_state(NumericAggState *state)
+ 	Assert(!state->promoted);
+ 	Assert(!state->calcSumX2);
+ 
++	/* guarded like numeric-agg-fast-start; see makeNumericAggState() */
++	if (TRACE_POSTGRESQL_NUMERIC_AGG_PROMOTE_ENABLED())
++		TRACE_POSTGRESQL_NUMERIC_AGG_PROMOTE((int) cause, (long) state->N);
++
+ 	/*
+ 	 * A zero sum at scale zero carries neither a value nor a display scale,
+ 	 * so there is nothing to move: leave the accumulator untouched and let
+@@ -5602,7 +5651,7 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
+ 			state->N++;
+ 			return;
+ 		}
+-		promote_numeric_agg_state(state);
++		promote_numeric_agg_state(state, NUMERIC_AGG_PROMOTE_ACCUM);
+ 	}
+ 
+ 	/* if we need X^2, calculate that in short-lived context */
+@@ -5732,7 +5781,7 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
+ 				state->N--;
+ 				return true;
+ 			}
+-			promote_numeric_agg_state(state);
++			promote_numeric_agg_state(state, NUMERIC_AGG_PROMOTE_DISCARD);
+ 		}
+ 	}
+ 
+@@ -6033,7 +6082,10 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
+ 
+ 		/* At least one side needs the digit-array path: promote state1 */
+ 		if (!state1->promoted)
+-			promote_numeric_agg_state(state1);
++			promote_numeric_agg_state(state1,
++									  state2->promoted ?
++									  NUMERIC_AGG_PROMOTE_COMBINE_MIXED :
++									  NUMERIC_AGG_PROMOTE_COMBINE_OVERFLOW);
+ 
+ 		if (state2->promoted)
+ 		{
+diff --git a/src/backend/utils/probes.d b/src/backend/utils/probes.d
+index 1929521c6a5..a68d177aa46 100644
+--- a/src/backend/utils/probes.d
++++ b/src/backend/utils/probes.d
+@@ -91,4 +91,7 @@ provider postgresql {
+ 	probe wal__switch();
+ 	probe wal__buffer__write__dirty__start();
+ 	probe wal__buffer__write__dirty__done();
++
++	probe numeric__agg__fast__start();
++	probe numeric__agg__promote(int, long);
+ };
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index bc1569ea189..411cf4c32cf 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1831,6 +1831,7 @@ NullTestType
+ NullableDatum
+ NullingRelsMatch
+ Numeric
++NumericAggPromoteCause
+ NumericAggState
+ NumericAggStateExt
+ NumericDigit
+-- 
+2.56.1
+

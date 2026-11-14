@@ -1,0 +1,99 @@
+From 5e6760be4b703139c07bea56fab2c121960071b6 Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Mon, 10 Aug 2026 20:17:23 +0200
+Subject: [PATCH v0 02/10] Add a memcmp fast path to numeric_eq
+
+Identical stored representations always denote equal values, so equality --
+unlike ordering -- can begin with a memcmp of the two datums and answer true
+without unpacking either one.  Values in one column share a display scale and
+store the same digits, so this hits for nearly every comparison that hash
+aggregation and hash joins perform.  Equal values with differing scales, and
+compressed or out-of-line values, fall through to the general case.
+
+The shortcut is valid for equality only.  Ordering cannot use it: 1.5 and 1.50
+are equal but differ bytewise, so a non-zero memcmp says nothing about which is
+the larger.
+
+This is deliberately a separate commit from the stack-unpacking that precedes
+it.  That change moves a buffer; this one rests on an argument about what the
+stored representation of a numeric means, so it should be reviewable, and
+revertable, on its own.  It is also the larger half of the benefit wherever the
+grouping key is wide or the hash table is large.  Measured on top of the
+preceding commit, same machine and method: grouping a million rows by twenty
+numeric(15,2) columns 2396 -> 1146 ms, grouping ten million rows by one numeric
+key over ten thousand groups 1911 -> 1208 ms, EXCEPT 2258 -> 1686 ms, and a
+hash join 2621 -> 2092 ms.  Against unpatched code those four are 2745 -> 1146,
+2241 -> 1208, 2798 -> 1686 and 3003 -> 2092 ms respectively, so this commit
+contributes between two thirds and four fifths of the total.
+
+It also helps precisely where the preceding commit cannot: grouping by a column
+of two-hundred-digit numerics, too wide to unpack onto the stack, still went
+1584 -> 1130 ms, because the memcmp answers without unpacking at all.
+
+It is not uniformly a win.  Comparing two different columns, as in WHERE a = b,
+the operands are almost never bytewise equal, so every call pays for a memcmp
+that fails and then does the full comparison anyway: that query measured
+401 -> 445 ms here, still well ahead of the 635 ms baseline but giving back a
+fifth of what the previous commit won.  Grouping on a single narrow key is
+neutral within noise.  The shapes that lose are rarer than the ones that gain,
+but the trade is real.
+
+With both commits in place, instructions retired -- counted exactly under
+callgrind rather than sampled -- fall 26.3% for a single-column HashAggregate,
+37.7% for a four-column one, and 19.2% for WHERE a = b.
+---
+ src/backend/utils/adt/numeric.c | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index 2e574b26d30..897c25e9d7b 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -2525,14 +2525,42 @@ numeric_cmp(PG_FUNCTION_ARGS)
+ Datum
+ numeric_eq(PG_FUNCTION_ARGS)
+ {
++	struct varlena *att1 = (struct varlena *) PG_GETARG_POINTER(0);
++	struct varlena *att2 = (struct varlena *) PG_GETARG_POINTER(1);
+ 	NumericLocalBuf buf1;
+ 	NumericLocalBuf buf2;
+ 	bool		free1;
+ 	bool		free2;
+-	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+-	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
++	Numeric		num1;
++	Numeric		num2;
+ 	bool		result;
+ 
++	/*
++	 * Identical stored representations always denote equal values, so for
++	 * equality -- unlike ordering -- we can start with a memcmp.  Values of
++	 * the same column share a display scale and store the same digits, so this
++	 * hits for nearly every comparison done by hash aggregation and hash
++	 * joins, and answers without unpacking either input.  Values that compare
++	 * equal with different scales, and compressed or out-of-line values, fall
++	 * through to the general case.
++	 *
++	 * Do not be tempted to reuse this for ordering: 1.5 and 1.50 are equal but
++	 * differ bytewise, so a non-zero memcmp implies nothing about which of two
++	 * numerics is the larger.
++	 */
++	if (likely(!VARATT_IS_COMPRESSED(att1) && !VARATT_IS_EXTERNAL(att1) &&
++			   !VARATT_IS_COMPRESSED(att2) && !VARATT_IS_EXTERNAL(att2)))
++	{
++		Size		len = VARSIZE_ANY_EXHDR(att1);
++
++		if (len == VARSIZE_ANY_EXHDR(att2) &&
++			memcmp(VARDATA_ANY(att1), VARDATA_ANY(att2), len) == 0)
++			PG_RETURN_BOOL(true);
++	}
++
++	num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
++	num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
++
+ 	result = cmp_numerics(num1, num2) == 0;
+ 
+ 	if (unlikely(free1))
+-- 
+2.56.1
+

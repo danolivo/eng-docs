@@ -1,0 +1,475 @@
+From febae7d0552eeb29d777e01034b3ade91bc2501c Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Sun, 8 Nov 2026 09:38:41 +0100
+Subject: [PATCH v0 09/10] Multiply short numerics without going through
+ mul_var()
+
+Products of stored columns -- price * quantity and the like -- multiply
+operands of a few NBASE digits.  For those, numeric_mul() spends far more on
+its machinery than on the arithmetic: it unpacks both operands into
+NumericVars, has mul_var() allocate a digit buffer for the product, strips
+it, copies it into a second palloc'd chunk in make_result() and frees the
+first.  Add numeric_mul_short(), which reads both operands where they lie,
+multiplies the digits in a local array and builds the result with a single
+palloc.  It handles short-format operands of up to five digits; anything
+else -- special values, long headers, wider operands, compressed or
+out-of-line datums -- takes the existing path.
+
+Five digits is where the simple loop stops paying off: for wider operands
+the unrolled code of mul_var_short() is as fast or faster.  Both operands
+are checked before either is decoded, so that a rejected product -- a short
+price times a wide amount, say -- does not first pay for unpacking the
+operand that did qualify.
+
+The result is the general path's to the bit: the product of two such
+operands is exact in at most ten digits, its display scale (the sum of the
+operand scales) is at most 126 and so is never rounded, and the header is
+chosen by the same NUMERIC_CAN_BE_SHORT() test make_result() applies.  The
+new regression test shows value, scale and stored size for the edge cases,
+including the two that need a long header, and compares ten thousand random
+products of zero to eight digit operands against numeric_mul_safe().
+
+The fast path also sidesteps a performance trap that an earlier commit,
+"Unpack short numerics on the stack in arithmetic and aggregation", ran
+into.  The header tests in numeric_mul_safe() and init_var_from_num() --
+"n_header & NUMERIC_SIGN_MASK" on a uint16 -- compile under gcc to 16-bit
+instructions with a 16-bit immediate, which stall the legacy x86 decoder
+(a length-changing prefix) whenever that code is not served from the uop
+cache.  Unpacking on the stack changed nothing in that code, but shifted it,
+and it moved out of the uop cache.  On Emerald Rapids, per row of
+count(qty * price), decode.lcp went from 0.01 to 11.9 and legacy-decoded uops
+from 23 to 88; that ate the whole gain from the saved allocations, and on
+another machine turned it into a loss.  Vanilla built with
+-falign-functions=64 stalls too, 4.9 times per row, so the hazard is layout
+luck rather than anything specific to that commit.
+numeric_mul_short() tests its flag bits with a shift, which gcc emits without
+the prefix, and a product it accepts no longer reaches numeric_mul_safe() at
+all.  A product it rejects still does, and still stalls there.
+---
+ src/backend/utils/adt/numeric.c       | 233 +++++++++++++++++++++++++-
+ src/test/regress/expected/numeric.out |  80 +++++++++
+ src/test/regress/sql/numeric.sql      |  57 +++++++
+ src/tools/pgindent/typedefs.list      |   1 +
+ 4 files changed, 369 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index 5940341e8f5..e496db937a0 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -3266,6 +3266,228 @@ numeric_sub_safe(Numeric num1, Numeric num2, Node *escontext)
+ }
+ 
+ 
++/*
++ * Multiplication of short operands.
++ *
++ * Most numerics that reach the * operator come straight out of a tuple and are
++ * small: a price, a quantity, an amount with two decimal places.  For those the
++ * general path spends far more on its machinery than on the multiplication: it
++ * copies each operand out of the tuple, unpacks it into a NumericVar, allocates
++ * a digit buffer for the product, strips it, copies it once more into the
++ * palloc'd result and frees the buffer.  numeric_mul_short() reads both
++ * operands where they lie, multiplies the digits in a local array and builds
++ * the result directly, with one allocation in total.
++ *
++ * It applies when both operands are inline (neither compressed nor out of
++ * line), stored in the short format -- which excludes NaN and the infinities --
++ * and have at most NUMERIC_MUL_SHORT_NDIGITS digits each.  Their exact product
++ * has at most twice as many digits, and its display scale, the sum of the two
++ * operand scales, is at most 2 * NUMERIC_SHORT_DSCALE_MAX.  That is the rscale
++ * numeric_mul_safe() asks mul_var() for, and it is far below
++ * NUMERIC_DSCALE_MAX, so the general path does not round either; the weight
++ * cannot overflow int16.  The result is therefore the one the general path
++ * produces, down to the choice of header format.
++ *
++ * The limit of five digits per operand is where the simple loop below stops
++ * paying off: for wider operands, the unrolled code of mul_var_short() is as
++ * fast or faster.
++ *
++ * Both operands are checked before either is unpacked, so that a product the
++ * fast path rejects -- a short price times a wide amount, say -- does not pay
++ * for decoding the operand that did qualify.  On an accepted product this only
++ * reorders the same work.
++ *
++ * The operand bytes are read with memcpy() of a fixed size, because a value
++ * with a one-byte varlena header is stored without alignment padding (see
++ * numeric_unpack_local()).
++ */
++#define NUMERIC_MUL_SHORT_NDIGITS	5
++
++/*
++ * A product position collects at most NUMERIC_MUL_SHORT_NDIGITS terms, each at
++ * most (NBASE - 1)^2, and the carry into it is below
++ * NUMERIC_MUL_SHORT_NDIGITS * NBASE; their sum must fit the uint32 accumulator.
++ */
++StaticAssertDecl((uint64) NUMERIC_MUL_SHORT_NDIGITS * NBASE * NBASE <= PG_UINT32_MAX,
++				 "NUMERIC_MUL_SHORT_NDIGITS is too large for a uint32 accumulator");
++
++typedef struct NumericShortOperand
++{
++	const char *data;			/* the numeric header word, then the digits */
++	uint32		header;
++	int			ndigits;
++	int			weight;
++	int			dscale;
++	bool		neg;
++	NumericDigit digits[NUMERIC_MUL_SHORT_NDIGITS];
++} NumericShortOperand;
++
++/*
++ * Return true if X qualifies for numeric_mul_short(), and set op->data,
++ * op->header and op->ndigits.  This is the whole cost of rejecting an operand.
++ */
++static inline bool
++numeric_check_short_operand(Datum X, NumericShortOperand *op)
++{
++	struct varlena *attr = (struct varlena *) DatumGetPointer(X);
++	Size		len;
++	uint16		rawheader;
++
++	/* see numeric_unpack_local() for why these two are tested first */
++	if (unlikely(VARATT_IS_COMPRESSED(attr) || VARATT_IS_EXTERNAL(attr)))
++		return false;
++
++	len = VARSIZE_ANY_EXHDR(attr);
++	if (len < sizeof(uint16) ||
++		len > sizeof(uint16) + NUMERIC_MUL_SHORT_NDIGITS * sizeof(NumericDigit))
++		return false;
++
++	/*
++	 * Widen the header and test the flag bits by shifting rather than by
++	 * masking with NUMERIC_SIGN_MASK.  On a uint16, gcc implements the mask
++	 * test with 16-bit instructions carrying a 16-bit immediate, and on x86
++	 * every such instruction stalls the legacy decoder (a length-changing
++	 * prefix).  That costs nothing while the code runs from the decoded-uop
++	 * cache, but whether it does depends on where the linker happens to place
++	 * it, and this path runs once per row.
++	 */
++	op->data = VARDATA_ANY(attr);
++	memcpy(&rawheader, op->data, sizeof(uint16));
++	op->header = rawheader;
++	if ((op->header >> 14) != (NUMERIC_SHORT >> 14))
++		return false;
++
++	op->ndigits = (len - sizeof(uint16)) / sizeof(NumericDigit);
++	return true;
++}
++
++/*
++ * Decode the header fields and the digits of an operand that has passed
++ * numeric_check_short_operand().
++ */
++static inline void
++numeric_unpack_short_operand(NumericShortOperand *op)
++{
++	uint32		header = op->header;
++	const char *src = op->data + sizeof(uint16);
++
++	op->neg = (header & NUMERIC_SHORT_SIGN_MASK) != 0;
++	op->dscale = (header & NUMERIC_SHORT_DSCALE_MASK) >>
++		NUMERIC_SHORT_DSCALE_SHIFT;
++	op->weight = ((header & NUMERIC_SHORT_WEIGHT_SIGN_MASK) ?
++				  ~NUMERIC_SHORT_WEIGHT_MASK : 0) |
++		(int) (header & NUMERIC_SHORT_WEIGHT_MASK);
++
++	/*
++	 * Copy digit by digit rather than with one memcpy() of the whole array. A
++	 * copy of variable length becomes a library call or an inline expansion,
++	 * and either costs more than the few 16-bit loads this compiles to.
++	 */
++	for (int i = 0; i < op->ndigits; i++)
++		memcpy(&op->digits[i], src + i * sizeof(NumericDigit),
++			   sizeof(NumericDigit));
++}
++
++/*
++ * Return X * Y, or NULL if either operand does not qualify; see above.
++ */
++static Numeric
++numeric_mul_short(Datum X, Datum Y)
++{
++	NumericShortOperand a;
++	NumericShortOperand b;
++	uint32		prod[2 * NUMERIC_MUL_SHORT_NDIGITS];
++	NumericDigit digits[2 * NUMERIC_MUL_SHORT_NDIGITS];
++	NumericDigit *res_digits;
++	NumericDigit *dst;
++	int			res_ndigits;
++	int			res_weight;
++	int			res_dscale;
++	bool		res_neg;
++	uint32		carry;
++	Numeric		result;
++	Size		len;
++
++	if (!numeric_check_short_operand(X, &a) ||
++		!numeric_check_short_operand(Y, &b))
++		return NULL;
++	numeric_unpack_short_operand(&a);
++	numeric_unpack_short_operand(&b);
++
++	res_ndigits = a.ndigits + b.ndigits;
++	res_weight = a.weight + b.weight + 1;
++	res_dscale = a.dscale + b.dscale;
++	res_neg = (a.neg != b.neg);
++
++	/*
++	 * Schoolbook multiplication.  As in mul_var_short(), the i'th product
++	 * digit collects the terms a[i1] * b[i2] with i = i1 + i2 + 1, leaving
++	 * prod[0] for the final carry.  The static assertion above guarantees
++	 * that no position overflows uint32, carry included.
++	 */
++	memset(prod, 0, sizeof(prod));
++	for (int i1 = 0; i1 < a.ndigits; i1++)
++		for (int i2 = 0; i2 < b.ndigits; i2++)
++			prod[i1 + i2 + 1] += (uint32) a.digits[i1] * (uint32) b.digits[i2];
++
++	carry = 0;
++	for (int i = res_ndigits - 1; i >= 0; i--)
++	{
++		uint32		term = prod[i] + carry;
++
++		digits[i] = (NumericDigit) (term % NBASE);
++		carry = term / NBASE;
++	}
++	Assert(carry == 0);
++
++	/* strip leading and trailing zeroes, as make_result() does */
++	res_digits = digits;
++	while (res_ndigits > 0 && *res_digits == 0)
++	{
++		res_digits++;
++		res_weight--;
++		res_ndigits--;
++	}
++	while (res_ndigits > 0 && res_digits[res_ndigits - 1] == 0)
++		res_ndigits--;
++
++	if (res_ndigits == 0)
++	{
++		res_weight = 0;
++		res_neg = false;
++	}
++
++	if (NUMERIC_CAN_BE_SHORT(res_dscale, res_weight))
++	{
++		len = NUMERIC_HDRSZ_SHORT + res_ndigits * sizeof(NumericDigit);
++		result = (Numeric) palloc(len);
++		SET_VARSIZE(result, len);
++		result->choice.n_short.n_header =
++			(res_neg ? (NUMERIC_SHORT | NUMERIC_SHORT_SIGN_MASK) : NUMERIC_SHORT)
++			| (res_dscale << NUMERIC_SHORT_DSCALE_SHIFT)
++			| (res_weight < 0 ? NUMERIC_SHORT_WEIGHT_SIGN_MASK : 0)
++			| (res_weight & NUMERIC_SHORT_WEIGHT_MASK);
++	}
++	else
++	{
++		len = NUMERIC_HDRSZ + res_ndigits * sizeof(NumericDigit);
++		result = (Numeric) palloc(len);
++		SET_VARSIZE(result, len);
++		result->choice.n_long.n_sign_dscale =
++			(res_neg ? NUMERIC_NEG : NUMERIC_POS) | res_dscale;
++		result->choice.n_long.n_weight = res_weight;
++	}
++
++	Assert(NUMERIC_NDIGITS(result) == res_ndigits);
++	Assert(NUMERIC_WEIGHT(result) == res_weight);
++	Assert(NUMERIC_DSCALE(result) == res_dscale);
++	dst = NUMERIC_DIGITS(result);
++	for (int i = 0; i < res_ndigits; i++)
++		dst[i] = res_digits[i];
++
++	return result;
++}
++
+ /*
+  * numeric_mul() -
+  *
+@@ -3278,10 +3500,17 @@ numeric_mul(PG_FUNCTION_ARGS)
+ 	NumericLocalBuf buf2;
+ 	bool		free1;
+ 	bool		free2;
+-	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+-	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
++	Numeric		num1;
++	Numeric		num2;
+ 	Numeric		res;
+ 
++	res = numeric_mul_short(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
++	if (likely(res != NULL))
++		PG_RETURN_NUMERIC(res);
++
++	num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
++	num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
++
+ 	res = numeric_mul_safe(num1, num2, fcinfo->context);
+ 
+ 	if (unlikely(free1))
+diff --git a/src/test/regress/expected/numeric.out b/src/test/regress/expected/numeric.out
+index 5185705965c..b8d0f3e2b52 100644
+--- a/src/test/regress/expected/numeric.out
++++ b/src/test/regress/expected/numeric.out
+@@ -4584,3 +4584,83 @@ GROUP BY m.fgrp ORDER BY m.fgrp;
+ COMMIT;
+ DROP TABLE num_fast_agg_scale_map;
+ DROP TABLE num_fast_agg_scale;
++--
++-- Multiplication of short operands.
++--
++-- numeric_mul_short() builds the product directly when both operands are
++-- short-format values of at most five digits.  Its result has to match the
++-- general path's exactly, including the display scale and the choice between
++-- the short and the long header, so show all three.  The operands come from a
++-- table, so that they reach numeric_mul() with a one-byte varlena header as
++-- column values do; the last rows exceed the five-digit limit or are special
++-- and take the general path, for comparison.
++--
++CREATE TABLE num_mul_short (id int, a numeric, b numeric);
++INSERT INTO num_mul_short VALUES
++  (1, 0, 0),
++  (2, '0.000', '-0.00'),          -- zero keeps the summed scale
++  (3, '-1.5', '0'),               -- a zero product is never negative
++  (4, '-0.5', '0.2'),             -- trailing zero digit stripped, scale kept
++  (5, '0.0001', '0.0001'),        -- negative weight
++  (6, '9999.9999', '9999.9999'),  -- carry into every digit
++  (7, '-1234.5678', '8765.4321'),
++  (8, '1e-63', '1e-63'),          -- scale 126: result needs the long header
++  (9, '1e250', '1e250'),          -- weight 125: result needs the long header
++  (10, '1e-60', '1e60'),
++  (11, '99999999999999999999', '99999999999999999999'),  -- five digits each
++  (12, '999999999999999999999', '2'),  -- six digits: general path
++  (13, '1.5', '999999999999999999999'),  -- rejected on the second operand
++  (14, '999999999999999999999', '1.5'),  -- rejected on the first operand
++  (15, 'NaN', '2'),
++  (16, '-Infinity', '0');
++SELECT id,
++       CASE WHEN length(p::text) <= 40 THEN p::text
++            ELSE left(p::text, 8) || '..' || right(p::text, 8) END AS product,
++       length(p::text) AS len, scale(p), pg_column_size(p) AS size
++FROM (SELECT id, a * b AS p FROM num_mul_short) s ORDER BY id;
++ id |                 product                  | len | scale | size 
++----+------------------------------------------+-----+-------+------
++  1 | 0                                        |   1 |     0 |    6
++  2 | 0.00000                                  |   7 |     5 |    6
++  3 | 0.0                                      |   3 |     1 |    6
++  4 | -0.10                                    |   5 |     2 |    8
++  5 | 0.00000001                               |  10 |     8 |    8
++  6 | 99999998.00000001                        |  17 |     8 |   14
++  7 | -10821520.22374638                       |  18 |     8 |   14
++  8 | 0.000000..00000001                       | 128 |   126 |   10
++  9 | 10000000..00000000                       | 501 |     0 |   10
++ 10 | 1.000000..00000000                       |  62 |    60 |    8
++ 11 | 9999999999999999999800000000000000000001 |  40 |     0 |   26
++ 12 | 1999999999999999999998                   |  22 |     0 |   18
++ 13 | 1499999999999999999998.5                 |  24 |     1 |   20
++ 14 | 1499999999999999999998.5                 |  24 |     1 |   20
++ 15 | NaN                                      |   3 |       |    6
++ 16 | NaN                                      |   3 |       |    6
++(16 rows)
++
++DROP TABLE num_mul_short;
++-- Compare with the general path on operands of zero to eight digits, signs
++-- and scales mixed.  jsonpath multiplies through numeric_mul_safe(), which
++-- the fast path does not reach.
++CREATE TABLE num_mul_short_oracle AS
++SELECT round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
++             * 10::numeric ^ (-(random() * 30)::int)
++             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
++             (random() * 16)::int) AS a,
++       round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
++             * 10::numeric ^ (-(random() * 30)::int)
++             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
++             (random() * 16)::int) AS b
++FROM generate_series(1, 10000);
++SELECT count(*) AS mismatches
++FROM num_mul_short_oracle,
++     LATERAL (SELECT a * b AS p,
++                     jsonb_path_query_first(jsonb_build_array(a, b),
++                                            '$[0] * $[1]')::numeric AS g) s
++WHERE p::text <> g::text OR scale(p) <> scale(g);
++ mismatches 
++------------
++          0
++(1 row)
++
++DROP TABLE num_mul_short_oracle;
+diff --git a/src/test/regress/sql/numeric.sql b/src/test/regress/sql/numeric.sql
+index 5f50bffa8f0..75a4a1448ab 100644
+--- a/src/test/regress/sql/numeric.sql
++++ b/src/test/regress/sql/numeric.sql
+@@ -1955,3 +1955,60 @@ COMMIT;
+ 
+ DROP TABLE num_fast_agg_scale_map;
+ DROP TABLE num_fast_agg_scale;
++
++--
++-- Multiplication of short operands.
++--
++-- numeric_mul_short() builds the product directly when both operands are
++-- short-format values of at most five digits.  Its result has to match the
++-- general path's exactly, including the display scale and the choice between
++-- the short and the long header, so show all three.  The operands come from a
++-- table, so that they reach numeric_mul() with a one-byte varlena header as
++-- column values do; the last rows exceed the five-digit limit or are special
++-- and take the general path, for comparison.
++--
++CREATE TABLE num_mul_short (id int, a numeric, b numeric);
++INSERT INTO num_mul_short VALUES
++  (1, 0, 0),
++  (2, '0.000', '-0.00'),          -- zero keeps the summed scale
++  (3, '-1.5', '0'),               -- a zero product is never negative
++  (4, '-0.5', '0.2'),             -- trailing zero digit stripped, scale kept
++  (5, '0.0001', '0.0001'),        -- negative weight
++  (6, '9999.9999', '9999.9999'),  -- carry into every digit
++  (7, '-1234.5678', '8765.4321'),
++  (8, '1e-63', '1e-63'),          -- scale 126: result needs the long header
++  (9, '1e250', '1e250'),          -- weight 125: result needs the long header
++  (10, '1e-60', '1e60'),
++  (11, '99999999999999999999', '99999999999999999999'),  -- five digits each
++  (12, '999999999999999999999', '2'),  -- six digits: general path
++  (13, '1.5', '999999999999999999999'),  -- rejected on the second operand
++  (14, '999999999999999999999', '1.5'),  -- rejected on the first operand
++  (15, 'NaN', '2'),
++  (16, '-Infinity', '0');
++SELECT id,
++       CASE WHEN length(p::text) <= 40 THEN p::text
++            ELSE left(p::text, 8) || '..' || right(p::text, 8) END AS product,
++       length(p::text) AS len, scale(p), pg_column_size(p) AS size
++FROM (SELECT id, a * b AS p FROM num_mul_short) s ORDER BY id;
++DROP TABLE num_mul_short;
++
++-- Compare with the general path on operands of zero to eight digits, signs
++-- and scales mixed.  jsonpath multiplies through numeric_mul_safe(), which
++-- the fast path does not reach.
++CREATE TABLE num_mul_short_oracle AS
++SELECT round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
++             * 10::numeric ^ (-(random() * 30)::int)
++             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
++             (random() * 16)::int) AS a,
++       round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
++             * 10::numeric ^ (-(random() * 30)::int)
++             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
++             (random() * 16)::int) AS b
++FROM generate_series(1, 10000);
++SELECT count(*) AS mismatches
++FROM num_mul_short_oracle,
++     LATERAL (SELECT a * b AS p,
++                     jsonb_path_query_first(jsonb_build_array(a, b),
++                                            '$[0] * $[1]')::numeric AS g) s
++WHERE p::text <> g::text OR scale(p) <> scale(g);
++DROP TABLE num_mul_short_oracle;
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index 9ef14d98502..bc1569ea189 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1834,6 +1834,7 @@ Numeric
+ NumericAggState
+ NumericAggStateExt
+ NumericDigit
++NumericShortOperand
+ NumericSortSupport
+ NumericSumAccum
+ NumericVar
+-- 
+2.56.1
+

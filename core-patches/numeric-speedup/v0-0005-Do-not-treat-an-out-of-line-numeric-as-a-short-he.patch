@@ -1,0 +1,123 @@
+From 3198cbe93694507cad52424f6b343b0c3ed61cbc Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Tue, 11 Aug 2026 08:24:21 +0200
+Subject: [PATCH v0 05/10] Do not treat an out-of-line numeric as a
+ short-header datum
+
+VARATT_IS_SHORT() is VARATT_IS_1B(), which tests a single header bit and is
+therefore true of an out-of-line TOAST pointer as well as of a genuine
+short-header datum.  numeric_unpack_local() tested it before the extended forms,
+so for an out-of-line numeric it took the short-header path, where
+VARSIZE_SHORT() returns 0 and subtracting VARHDRSZ_SHORT from it underflows
+Size.  The memcpy that follows was then handed SIZE_MAX.
+
+The bound test on the copy length happened to catch this -- SIZE_MAX fails it and
+control falls through to DatumGetNumeric() -- so the committed code is not
+broken.  It is only accidentally correct, and the test that saves it was
+documented as a redundant belt-and-braces check that could be reduced to an
+assertion.  Doing that would have turned this into a stack overwrite on any
+query that hashed, compared or summed a numeric wide enough to be stored out of
+line.
+
+Test the compressed and out-of-line forms first, which is also what
+numeric_eq()'s byte-equality shortcut already does, so the two now agree about
+what has to be excluded before a datum may be read in place.  With those forms
+out of the way the bound genuinely cannot fail: a one-byte header that is not an
+external pointer has its low bit set and is not 0x01, so VARSIZE_SHORT() is at
+least 1 and at most VARATT_SHORT_MAX.  The check is therefore reduced to an
+Assert(), which also stops the compiler expanding the copy inline -- 11% slower
+across the ordinary numeric workloads under gcc on x86-64, where the inline
+expansion loses to the libc routine at these payload sizes.
+
+Found by the regression test added in the previous commit, which was the first
+thing in the suite to hash or compare an out-of-line numeric.
+---
+ src/backend/utils/adt/numeric.c | 61 +++++++++++++++++++--------------
+ 1 file changed, 36 insertions(+), 25 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index 789ed718e35..cd0e378ee49 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -553,6 +553,20 @@ numeric_unpack_local(Datum X, NumericLocalBuf *buf, bool *needfree)
+ {
+ 	struct varlena *attr = (struct varlena *) DatumGetPointer(X);
+ 
++	/*
++	 * Deal with the compressed and out-of-line forms first.  The order matters,
++	 * and not for tidiness: VARATT_IS_SHORT() is VARATT_IS_1B(), which tests one
++	 * header bit and is therefore true of an out-of-line TOAST pointer as well
++	 * as of a genuine short-header datum.  VARSIZE_SHORT() of a TOAST pointer is
++	 * 0, so a short-header test placed first would compute a data_size of
++	 * (Size) -1 and hand SIZE_MAX to memcpy.
++	 */
++	if (unlikely(VARATT_IS_COMPRESSED(attr) || VARATT_IS_EXTERNAL(attr)))
++	{
++		*needfree = true;
++		return DatumGetNumeric(X);
++	}
++
+ 	*needfree = false;
+ 
+ 	if (VARATT_IS_SHORT(attr))
+@@ -560,35 +574,32 @@ numeric_unpack_local(Datum X, NumericLocalBuf *buf, bool *needfree)
+ 		Size		data_size = VARSIZE_SHORT(attr) - VARHDRSZ_SHORT;
+ 
+ 		/*
+-		 * The buffer is sized to the largest payload a short header can
+-		 * describe and VARSIZE_SHORT() returns a seven-bit field, so this test
+-		 * cannot fail in practice.  Keep it anyway, for two reasons.
++		 * With the extended forms excluded above, the copy cannot overrun.
++		 * Enumerating what can reach here: a one-byte header that is not an
++		 * external pointer means va_header has its low bit set and is not 0x01,
++		 * so VARSIZE_SHORT() lies between 1 and VARATT_SHORT_MAX, hence
++		 * data_size between 0 and VARATT_SHORT_MAX - VARHDRSZ_SHORT, which is
++		 * exactly what the buffer is sized for.
+ 		 *
+-		 * The first is that it is the only thing bounding a memcpy whose length
+-		 * comes from on-disk data.  The reasoning that makes it unfailable spans
+-		 * three constants in two files; that is too thin a thread to hang an
+-		 * unchecked write to a fixed stack buffer on, in a function this deep
+-		 * inside the executor.
+-		 *
+-		 * The second is that it gives the compiler a bound on the copy, which
+-		 * some compilers use to expand it inline rather than call memcpy.  Which
+-		 * of the two is faster is platform-dependent and not worth encoding
+-		 * here; the branch is predicted correctly every time either way.
++		 * Assert that rather than test it at runtime, deliberately.  A runtime
++		 * test hands the compiler a bound on the length, and some compilers
++		 * respond by expanding the copy inline instead of calling memcpy; that
++		 * measured 11% slower across the ordinary numeric workloads under gcc on
++		 * x86-64, where the inline expansion is worse than the libc routine for
++		 * payloads this small.  clang emits the call either way.  The assertion
++		 * keeps the check where a violation would be caught, on the buildfarm,
++		 * without pessimising the builds people actually run.
+ 		 */
+-		if (likely(data_size <= sizeof(buf->data) - VARHDRSZ))
+-		{
+-			SET_VARSIZE(&buf->num, data_size + VARHDRSZ);
+-			memcpy((char *) &buf->num + VARHDRSZ,
+-				   VARDATA_SHORT(attr), data_size);
+-			return &buf->num;
+-		}
++		Assert(data_size <= sizeof(buf->data) - VARHDRSZ);
++
++		SET_VARSIZE(&buf->num, data_size + VARHDRSZ);
++		memcpy((char *) &buf->num + VARHDRSZ,
++			   VARDATA_SHORT(attr), data_size);
++		return &buf->num;
+ 	}
+-	else if (likely(!VARATT_IS_EXTENDED(attr)))
+-		return (Numeric) attr;
+ 
+-	/* compressed or out-of-line */
+-	*needfree = true;
+-	return DatumGetNumeric(X);
++	/* plain four-byte header: the accessors can read it where it lies */
++	return (Numeric) attr;
+ }
+ 
+ static void alloc_var(NumericVar *var, int ndigits);
+-- 
+2.56.1
+
