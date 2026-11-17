@@ -184,6 +184,8 @@ Each case is one situation where a comparison of two tables can give a wrong ans
 |  | `key.k20_empty_n2` | 3 rows only on n1; n2 is empty | 3 / 0 / 0 |  |  |
 |  | `key.k20_one_row` | match: one row | 0 / 0 / 0 |  |  |
 |  | `key.k20_one_row_diff` | 1 changed row | 0 / 0 / 1 |  |  |
+| **K21** the collation of a text key is not the default collation of the database; it is the same on both nodes | `key.k21_key_numeric_collation` | 11 changed rows, key 5001 only on n1, key 05 only on n2; the key sorts by numbers (2 < 10), the default collation of the database sorts 10 < 2; a plan range 2..10 by the key takes 3 and not 100 | 1 / 1 / 11 |  |  |
+|  | `key.k21_key_c_collation` | 10 changed rows, key zz only on n1, key AA only on n2; the key sorts as C (B < _x < a < f < é), not as the default collation of the database | 1 / 1 / 10 |  |  |
 
 ## D. Other data types
 

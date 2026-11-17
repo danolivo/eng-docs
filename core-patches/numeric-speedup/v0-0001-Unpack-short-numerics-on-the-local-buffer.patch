@@ -1,7 +1,7 @@
-From e000ba3942ec0fc291cc9967a4c7c306f03666b0 Mon Sep 17 00:00:00 2001
+From c82d6c992966d0e6e9da6d974691b1e91a2310ac Mon Sep 17 00:00:00 2001
 From: "Andrei V. Lepikhov" <lepihov@gmail.com>
 Date: Mon, 10 Aug 2026 20:17:03 +0200
-Subject: [PATCH v0 1/2] Unpack short numerics on the local buffer
+Subject: [PATCH v0 1/3] Unpack short numerics on the local buffer
 
 The hash, comparison and sortsupport functions for numeric are hot, but every
 call ran DatumGetNumeric() on its input. Numerics come out of a tuple with
@@ -17,15 +17,15 @@ functions never freed theirs; they keep leaving it to the caller's memory
 context, so for them PG_GETARG_NUMERIC_LOCAL() simply replaces
 PG_GETARG_NUMERIC().
 ---
- src/backend/utils/adt/numeric.c  | 199 ++++++++++++++++++-------------
+ src/backend/utils/adt/numeric.c  | 189 +++++++++++++++++--------------
  src/tools/pgindent/typedefs.list |   1 +
- 2 files changed, 114 insertions(+), 86 deletions(-)
+ 2 files changed, 104 insertions(+), 86 deletions(-)
 
 diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
-index 7deea2046f1..0113934786e 100644
+index 7deea2046f1..965ff8c27e5 100644
 --- a/src/backend/utils/adt/numeric.c
 +++ b/src/backend/utils/adt/numeric.c
-@@ -494,6 +494,75 @@ static void dump_var(const char *str, NumericVar *var);
+@@ -494,6 +494,65 @@ static void dump_var(const char *str, NumericVar *var);
  	(weight) <= NUMERIC_SHORT_WEIGHT_MAX && \
  	(weight) >= NUMERIC_SHORT_WEIGHT_MIN)
  
@@ -38,21 +38,11 @@ index 7deea2046f1..0113934786e 100644
 +} NumericLocalBuf;
 +
 +/*
-+ * The fast path below is only reached when the payload fits, so shrinking this
-+ * buffer would not corrupt anything -- it would silently send a band of widths
-+ * back to palloc, which is the regression this sizing exists to avoid.  Assert
-+ * the property rather than leave it to be rediscovered by measurement.
-+ */
-+StaticAssertDecl(sizeof(((NumericLocalBuf *) 0)->data) - VARHDRSZ >=
-+				 VARATT_SHORT_MAX - VARHDRSZ_SHORT,
-+				 "NumericLocalBuf cannot hold every short-header numeric");
-+
-+/*
 + * Return a four-byte-header Numeric for X, using *buf when possible.  Sets
 + * *needfree if the result is a palloc'd detoasted copy.  Callers that must
-+ * not leak memory, such as the comparison functions, pfree it; the others use
++ * not leak memory, such as the comparison functions, pfree it.  The others use
 + * DatumGetNumericLocal() below and leave the copy to the caller's memory
-+ * context, just as PG_GETARG_NUMERIC() does.
++ * context.
 + */
 +static inline Numeric
 +numeric_unpack_local(Datum X, NumericLocalBuf *buf, bool *needfree)
@@ -101,7 +91,7 @@ index 7deea2046f1..0113934786e 100644
  static void alloc_var(NumericVar *var, int ndigits);
  static void free_var(NumericVar *var);
  static void zero_var(NumericVar *var);
-@@ -2273,32 +2342,44 @@ numeric_abbrev_abort(int memtupcount, SortSupport ssup)
+@@ -2273,32 +2332,44 @@ numeric_abbrev_abort(int memtupcount, SortSupport ssup)
  }
  
  /*
@@ -160,7 +150,7 @@ index 7deea2046f1..0113934786e 100644
  /*
   * Compare abbreviations of values. (Abbreviations may be equal where the true
   * values differ, but if the abbreviations differ, they must reflect the
-@@ -2418,107 +2499,51 @@ numeric_abbrev_convert_var(const NumericVar *var, NumericSortSupport *nss)
+@@ -2418,107 +2489,51 @@ numeric_abbrev_convert_var(const NumericVar *var, NumericSortSupport *nss)
  Datum
  numeric_cmp(PG_FUNCTION_ARGS)
  {
@@ -282,7 +272,7 @@ index 7deea2046f1..0113934786e 100644
  }
  
  static int
-@@ -2716,7 +2741,8 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
+@@ -2716,7 +2731,8 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
  Datum
  hash_numeric(PG_FUNCTION_ARGS)
  {
@@ -292,7 +282,7 @@ index 7deea2046f1..0113934786e 100644
  	uint32		digit_hash;
  	uint32		result;
  	int			weight;
-@@ -2797,7 +2823,8 @@ hash_numeric(PG_FUNCTION_ARGS)
+@@ -2797,7 +2813,8 @@ hash_numeric(PG_FUNCTION_ARGS)
  Datum
  hash_numeric_extended(PG_FUNCTION_ARGS)
  {

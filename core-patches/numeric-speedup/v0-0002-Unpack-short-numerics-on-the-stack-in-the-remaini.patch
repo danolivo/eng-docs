@@ -1,7 +1,7 @@
-From 4644d8dba53433f209adae4a87b1316ec793e71d Mon Sep 17 00:00:00 2001
+From e02d76b121a2fe0c78695abf1387b3e7c5948c6a Mon Sep 17 00:00:00 2001
 From: "Andrei V. Lepikhov" <lepihov@gmail.com>
 Date: Tue, 17 Nov 2026 06:53:21 +0100
-Subject: [PATCH v0 2/2] Unpack short numerics on the stack in the remaining
+Subject: [PATCH v0 2/3] Unpack short numerics on the stack in the remaining
  functions
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH v0 2/2] Unpack short numerics on the stack in the remaining
  1 file changed, 74 insertions(+), 62 deletions(-)
 
 diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
-index 0113934786e..fcc9c77349b 100644
+index 965ff8c27e5..ba5502df5a7 100644
 --- a/src/backend/utils/adt/numeric.c
 +++ b/src/backend/utils/adt/numeric.c
 @@ -340,7 +340,6 @@ typedef struct
@@ -20,7 +20,7 @@ index 0113934786e..fcc9c77349b 100644
  	int64		input_count;	/* number of non-null values seen */
  	bool		estimating;		/* true if estimating cardinality */
  
-@@ -867,7 +866,8 @@ invalid_syntax:
+@@ -857,7 +856,8 @@ invalid_syntax:
  Datum
  numeric_out(PG_FUNCTION_ARGS)
  {
@@ -30,7 +30,7 @@ index 0113934786e..fcc9c77349b 100644
  	NumericVar	x;
  	char	   *str;
  
-@@ -1214,7 +1214,8 @@ numeric_recv(PG_FUNCTION_ARGS)
+@@ -1204,7 +1204,8 @@ numeric_recv(PG_FUNCTION_ARGS)
  Datum
  numeric_send(PG_FUNCTION_ARGS)
  {
@@ -40,7 +40,7 @@ index 0113934786e..fcc9c77349b 100644
  	NumericVar	x;
  	StringInfoData buf;
  	int			i;
-@@ -1452,7 +1453,8 @@ numerictypmodout(PG_FUNCTION_ARGS)
+@@ -1442,7 +1443,8 @@ numerictypmodout(PG_FUNCTION_ARGS)
  Datum
  numeric_abs(PG_FUNCTION_ARGS)
  {
@@ -50,7 +50,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  
  	/*
-@@ -1479,7 +1481,8 @@ numeric_abs(PG_FUNCTION_ARGS)
+@@ -1469,7 +1471,8 @@ numeric_abs(PG_FUNCTION_ARGS)
  Datum
  numeric_uminus(PG_FUNCTION_ARGS)
  {
@@ -60,7 +60,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  
  	/*
-@@ -1569,7 +1572,8 @@ numeric_sign_internal(Numeric num)
+@@ -1559,7 +1562,8 @@ numeric_sign_internal(Numeric num)
  Datum
  numeric_sign(PG_FUNCTION_ARGS)
  {
@@ -70,7 +70,7 @@ index 0113934786e..fcc9c77349b 100644
  
  	/*
  	 * Handle NaN (infinities can be handled normally)
-@@ -1602,7 +1606,8 @@ numeric_sign(PG_FUNCTION_ARGS)
+@@ -1592,7 +1596,8 @@ numeric_sign(PG_FUNCTION_ARGS)
  Datum
  numeric_round(PG_FUNCTION_ARGS)
  {
@@ -80,7 +80,7 @@ index 0113934786e..fcc9c77349b 100644
  	int32		scale = PG_GETARG_INT32(1);
  	Numeric		res;
  	NumericVar	arg;
-@@ -1656,7 +1661,8 @@ numeric_round(PG_FUNCTION_ARGS)
+@@ -1646,7 +1651,8 @@ numeric_round(PG_FUNCTION_ARGS)
  Datum
  numeric_trunc(PG_FUNCTION_ARGS)
  {
@@ -90,7 +90,7 @@ index 0113934786e..fcc9c77349b 100644
  	int32		scale = PG_GETARG_INT32(1);
  	Numeric		res;
  	NumericVar	arg;
-@@ -1706,7 +1712,8 @@ numeric_trunc(PG_FUNCTION_ARGS)
+@@ -1696,7 +1702,8 @@ numeric_trunc(PG_FUNCTION_ARGS)
  Datum
  numeric_ceil(PG_FUNCTION_ARGS)
  {
@@ -100,7 +100,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  	NumericVar	result;
  
-@@ -1734,7 +1741,8 @@ numeric_ceil(PG_FUNCTION_ARGS)
+@@ -1724,7 +1731,8 @@ numeric_ceil(PG_FUNCTION_ARGS)
  Datum
  numeric_floor(PG_FUNCTION_ARGS)
  {
@@ -110,7 +110,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  	NumericVar	result;
  
-@@ -2026,9 +2034,12 @@ generate_series_numeric_support(PG_FUNCTION_ARGS)
+@@ -2016,9 +2024,12 @@ generate_series_numeric_support(PG_FUNCTION_ARGS)
  Datum
  width_bucket_numeric(PG_FUNCTION_ARGS)
  {
@@ -126,7 +126,7 @@ index 0113934786e..fcc9c77349b 100644
  	int32		count = PG_GETARG_INT32(3);
  	NumericVar	count_var;
  	NumericVar	result_var;
-@@ -2195,12 +2206,6 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
+@@ -2185,12 +2196,6 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
  
  		nss = palloc_object(NumericSortSupport);
  
@@ -139,7 +139,7 @@ index 0113934786e..fcc9c77349b 100644
  		nss->input_count = 0;
  		nss->estimating = true;
  		initHyperLogLog(&nss->abbr_card, 10);
-@@ -2226,31 +2231,13 @@ static Datum
+@@ -2216,31 +2221,13 @@ static Datum
  numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
  {
  	NumericSortSupport *nss = ssup->ssup_extra;
@@ -174,7 +174,7 @@ index 0113934786e..fcc9c77349b 100644
  	if (NUMERIC_IS_SPECIAL(value))
  	{
  		if (NUMERIC_IS_PINF(value))
-@@ -2269,9 +2256,9 @@ numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
+@@ -2259,9 +2246,9 @@ numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
  		result = numeric_abbrev_convert_var(&var, nss);
  	}
  
@@ -187,7 +187,7 @@ index 0113934786e..fcc9c77349b 100644
  
  	return result;
  }
-@@ -2606,9 +2593,18 @@ cmp_numerics(Numeric num1, Numeric num2)
+@@ -2596,9 +2583,18 @@ cmp_numerics(Numeric num1, Numeric num2)
  Datum
  in_range_numeric_numeric(PG_FUNCTION_ARGS)
  {
@@ -209,7 +209,7 @@ index 0113934786e..fcc9c77349b 100644
  	bool		sub = PG_GETARG_BOOL(3);
  	bool		less = PG_GETARG_BOOL(4);
  	bool		result;
-@@ -2731,9 +2727,12 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
+@@ -2721,9 +2717,12 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
  		free_var(&sum);
  	}
  
@@ -225,7 +225,7 @@ index 0113934786e..fcc9c77349b 100644
  
  	PG_RETURN_BOOL(result);
  }
-@@ -3282,8 +3281,10 @@ division_by_zero:
+@@ -3272,8 +3271,10 @@ division_by_zero:
  Datum
  numeric_div_trunc(PG_FUNCTION_ARGS)
  {
@@ -238,7 +238,7 @@ index 0113934786e..fcc9c77349b 100644
  	NumericVar	arg1;
  	NumericVar	arg2;
  	NumericVar	result;
-@@ -3371,8 +3372,10 @@ numeric_div_trunc(PG_FUNCTION_ARGS)
+@@ -3361,8 +3362,10 @@ numeric_div_trunc(PG_FUNCTION_ARGS)
  Datum
  numeric_mod(PG_FUNCTION_ARGS)
  {
@@ -251,7 +251,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  
  	res = numeric_mod_safe(num1, num2, NULL);
-@@ -4142,7 +4145,8 @@ numeric_power(PG_FUNCTION_ARGS)
+@@ -4132,7 +4135,8 @@ numeric_power(PG_FUNCTION_ARGS)
  Datum
  numeric_scale(PG_FUNCTION_ARGS)
  {
@@ -261,7 +261,7 @@ index 0113934786e..fcc9c77349b 100644
  
  	if (NUMERIC_IS_SPECIAL(num))
  		PG_RETURN_NULL();
-@@ -4207,7 +4211,8 @@ get_min_scale(NumericVar *var)
+@@ -4197,7 +4201,8 @@ get_min_scale(NumericVar *var)
  Datum
  numeric_min_scale(PG_FUNCTION_ARGS)
  {
@@ -271,7 +271,7 @@ index 0113934786e..fcc9c77349b 100644
  	NumericVar	arg;
  	int			min_scale;
  
-@@ -4227,7 +4232,8 @@ numeric_min_scale(PG_FUNCTION_ARGS)
+@@ -4217,7 +4222,8 @@ numeric_min_scale(PG_FUNCTION_ARGS)
  Datum
  numeric_trim_scale(PG_FUNCTION_ARGS)
  {
@@ -281,7 +281,7 @@ index 0113934786e..fcc9c77349b 100644
  	Numeric		res;
  	NumericVar	result;
  
-@@ -4437,7 +4443,8 @@ numeric_int4_safe(Numeric num, Node *escontext)
+@@ -4427,7 +4433,8 @@ numeric_int4_safe(Numeric num, Node *escontext)
  Datum
  numeric_int4(PG_FUNCTION_ARGS)
  {
@@ -291,7 +291,7 @@ index 0113934786e..fcc9c77349b 100644
  	int32		result;
  
  	result = numeric_int4_safe(num, fcinfo->context);
-@@ -4513,7 +4520,8 @@ numeric_int8_safe(Numeric num, Node *escontext)
+@@ -4503,7 +4510,8 @@ numeric_int8_safe(Numeric num, Node *escontext)
  Datum
  numeric_int8(PG_FUNCTION_ARGS)
  {
@@ -301,7 +301,7 @@ index 0113934786e..fcc9c77349b 100644
  	int64		result;
  
  	result = numeric_int8_safe(num, fcinfo->context);
-@@ -4537,7 +4545,8 @@ int2_numeric(PG_FUNCTION_ARGS)
+@@ -4527,7 +4535,8 @@ int2_numeric(PG_FUNCTION_ARGS)
  Datum
  numeric_int2(PG_FUNCTION_ARGS)
  {
@@ -311,7 +311,7 @@ index 0113934786e..fcc9c77349b 100644
  	NumericVar	x;
  	int64		val;
  	int16		result;
-@@ -4613,7 +4622,8 @@ float8_numeric(PG_FUNCTION_ARGS)
+@@ -4603,7 +4612,8 @@ float8_numeric(PG_FUNCTION_ARGS)
  Datum
  numeric_float8(PG_FUNCTION_ARGS)
  {
@@ -321,7 +321,7 @@ index 0113934786e..fcc9c77349b 100644
  	char	   *tmp;
  	Datum		result;
  
-@@ -4650,7 +4660,8 @@ numeric_float8(PG_FUNCTION_ARGS)
+@@ -4640,7 +4650,8 @@ numeric_float8(PG_FUNCTION_ARGS)
  Datum
  numeric_float8_no_overflow(PG_FUNCTION_ARGS)
  {
@@ -331,7 +331,7 @@ index 0113934786e..fcc9c77349b 100644
  	double		val;
  
  	if (NUMERIC_IS_SPECIAL(num))
-@@ -4712,7 +4723,8 @@ float4_numeric(PG_FUNCTION_ARGS)
+@@ -4702,7 +4713,8 @@ float4_numeric(PG_FUNCTION_ARGS)
  Datum
  numeric_float4(PG_FUNCTION_ARGS)
  {

@@ -229,6 +229,32 @@ UPDATE key.k16_key_collation SET v = 'changed' WHERE id IN (SELECT CASE WHEN i %
 \endif
 CALL ref_meta.reg('K16', 'key.k16_key_collation', '3 changed rows and nothing else; the key sorts as C on n1 and as ICU on n2, so a range of keys selects other rows on each node');
 
+-- K21: the collation of a text key is not the default collation of the
+-- database; it is the same on both nodes.
+CREATE COLLATION key.k21_num (provider = icu, locale = 'und-u-kn');
+CREATE TABLE key.k21_key_numeric_collation (id text COLLATE key.k21_num PRIMARY KEY, v text);
+CREATE TABLE key.k21_key_c_collation (id text COLLATE "C" PRIMARY KEY, v text);
+INSERT INTO key.k21_key_numeric_collation SELECT i::text, 'v' || i FROM generate_series(1, 5000) i;
+INSERT INTO key.k21_key_numeric_collation VALUES ('a2', 'x'), ('a10', 'x'), ('b1', 'x');
+INSERT INTO key.k21_key_c_collation
+	SELECT CASE WHEN i % 2 = 0 THEN chr(65 + i % 26) ELSE chr(97 + i % 26) END || '-' || lpad(i::text, 5, '0'), 'v' || i
+	FROM generate_series(1, 5000) i;
+INSERT INTO key.k21_key_c_collation VALUES ('a-a', 'x'), ('a+a', 'x'), ('aa', 'x'), ('B', 'x'), ('b', 'x'), ('_x', 'x'), (U&'\00E9', 'x'), ('f', 'x');
+\if :n1
+INSERT INTO key.k21_key_numeric_collation VALUES ('5001', 'only n1');
+INSERT INTO key.k21_key_c_collation VALUES ('zz', 'only n1');
+\else
+INSERT INTO key.k21_key_numeric_collation VALUES ('05', 'only n2');
+INSERT INTO key.k21_key_c_collation VALUES ('AA', 'only n2');
+UPDATE key.k21_key_numeric_collation SET v = 'changed'
+	WHERE id IN ('1', '2', '9', '10', '99', '100', '999', '1000', '5000', 'a2', 'a10');
+UPDATE key.k21_key_c_collation SET v = 'changed'
+	WHERE id IN ('a-a', 'B', '_x', U&'\00E9')
+	   OR id IN (SELECT CASE WHEN i % 2 = 0 THEN chr(65 + i % 26) ELSE chr(97 + i % 26) END || '-' || lpad(i::text, 5, '0') FROM unnest(ARRAY[1, 26, 27, 2611, 2612, 5000]) i);
+\endif
+CALL ref_meta.reg('K21', 'key.k21_key_numeric_collation', '11 changed rows, key 5001 only on n1, key 05 only on n2; the key sorts by numbers (2 < 10), the default collation of the database sorts 10 < 2; a plan range 2..10 by the key takes 3 and not 100');
+CALL ref_meta.reg('K21', 'key.k21_key_c_collation', '10 changed rows, key zz only on n1, key AA only on n2; the key sorts as C (B < _x < a < f < é), not as the default collation of the database');
+
 -- K19: skewed keys.
 CREATE TABLE key.k19_skewed (tenant int, id bigint, v text, PRIMARY KEY (tenant, id));
 INSERT INTO key.k19_skewed SELECT 1, i, 'v' || i FROM generate_series(1, 5000) i;

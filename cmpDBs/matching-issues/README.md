@@ -85,7 +85,7 @@ Rules:
 ./expected.py n1 n2 --check expected.csv
 ```
 
-The helper computes the numbers of both rules from the two databases and compares them with the file. It needs both databases in one instance and takes the connection from the usual `PG*` variables. The last line must be `197 tables, 0 differ from expected.csv`.
+The helper computes the numbers of both rules from the two databases and compares them with the file. It needs both databases in one instance and takes the connection from the usual `PG*` variables. The last line must be `199 tables, 0 differ from expected.csv`.
 
 ### 3. List the tables and their keys
 
