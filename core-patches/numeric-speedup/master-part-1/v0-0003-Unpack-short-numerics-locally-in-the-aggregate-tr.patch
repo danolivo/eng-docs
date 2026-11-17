@@ -1,0 +1,142 @@
+From c9b393909c6fcf7dd4575cd3bce4f9ae18a42b06 Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Tue, 17 Nov 2026 10:44:57 +0100
+Subject: [PATCH v0 3/3] Unpack short numerics locally in the aggregate
+ transition functions
+
+numeric_accum(), numeric_avg_accum() and numeric_accum_inv(), which
+implement sum(), avg(), variance() and stddev() over numeric, copied every
+short-header input with PG_GETARG_NUMERIC().  The input is used only
+within the call, so read it with PG_GETARG_NUMERIC_LOCAL().  That copy was
+often the only allocation the transition function made per row; without
+it the per-tuple memory context stays empty, and its reset after every
+row has nothing to do.
+
+numeric_larger() and numeric_smaller(), the transition functions of max()
+and min(), copied both arguments and returned one of the copies.  Compare
+them through local buffers instead, and return the winning argument as it
+was passed in, possibly with a short header, as text_larger() does.
+Compressed and out-of-line arguments are still fetched first, so a TOAST
+pointer never becomes the transition value.
+---
+ src/backend/utils/adt/numeric.c | 43 +++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index ba5502df5a7..6a3b7a69cef 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -3473,17 +3473,24 @@ numeric_inc(PG_FUNCTION_ARGS)
+ Datum
+ numeric_smaller(PG_FUNCTION_ARGS)
+ {
+-	Numeric		num1 = PG_GETARG_NUMERIC(0);
+-	Numeric		num2 = PG_GETARG_NUMERIC(1);
++	/* fetch out-of-line and compressed values, but keep short headers */
++	varlena    *arg1 = PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(0));
++	varlena    *arg2 = PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(1));
++	NumericLocalBuf buf1;
++	NumericLocalBuf buf2;
++	Numeric		num1 = DatumGetNumericLocal(PointerGetDatum(arg1), &buf1);
++	Numeric		num2 = DatumGetNumericLocal(PointerGetDatum(arg2), &buf2);
+ 
+ 	/*
+ 	 * Use cmp_numerics so that this will agree with the comparison operators,
+-	 * particularly as regards comparisons involving NaN.
++	 * particularly as regards comparisons involving NaN.  Return the smaller
++	 * argument as it was passed in, possibly with a short header, as
++	 * text_smaller() does; num1 and num2 may point into our stack frame.
+ 	 */
+ 	if (cmp_numerics(num1, num2) < 0)
+-		PG_RETURN_NUMERIC(num1);
++		PG_RETURN_POINTER(arg1);
+ 	else
+-		PG_RETURN_NUMERIC(num2);
++		PG_RETURN_POINTER(arg2);
+ }
+ 
+ 
+@@ -3495,17 +3502,24 @@ numeric_smaller(PG_FUNCTION_ARGS)
+ Datum
+ numeric_larger(PG_FUNCTION_ARGS)
+ {
+-	Numeric		num1 = PG_GETARG_NUMERIC(0);
+-	Numeric		num2 = PG_GETARG_NUMERIC(1);
++	/* fetch out-of-line and compressed values, but keep short headers */
++	varlena    *arg1 = PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(0));
++	varlena    *arg2 = PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(1));
++	NumericLocalBuf buf1;
++	NumericLocalBuf buf2;
++	Numeric		num1 = DatumGetNumericLocal(PointerGetDatum(arg1), &buf1);
++	Numeric		num2 = DatumGetNumericLocal(PointerGetDatum(arg2), &buf2);
+ 
+ 	/*
+ 	 * Use cmp_numerics so that this will agree with the comparison operators,
+-	 * particularly as regards comparisons involving NaN.
++	 * particularly as regards comparisons involving NaN.  Return the larger
++	 * argument as it was passed in, possibly with a short header, as
++	 * text_larger() does; num1 and num2 may point into our stack frame.
+ 	 */
+ 	if (cmp_numerics(num1, num2) > 0)
+-		PG_RETURN_NUMERIC(num1);
++		PG_RETURN_POINTER(arg1);
+ 	else
+-		PG_RETURN_NUMERIC(num2);
++		PG_RETURN_POINTER(arg2);
+ }
+ 
+ 
+@@ -5020,6 +5034,7 @@ Datum
+ numeric_accum(PG_FUNCTION_ARGS)
+ {
+ 	NumericAggState *state;
++	NumericLocalBuf buf;
+ 
+ 	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+ 
+@@ -5028,7 +5043,7 @@ numeric_accum(PG_FUNCTION_ARGS)
+ 		state = makeNumericAggState(fcinfo, true);
+ 
+ 	if (!PG_ARGISNULL(1))
+-		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
++		do_numeric_accum(state, PG_GETARG_NUMERIC_LOCAL(1, &buf));
+ 
+ 	PG_RETURN_POINTER(state);
+ }
+@@ -5120,6 +5135,7 @@ Datum
+ numeric_avg_accum(PG_FUNCTION_ARGS)
+ {
+ 	NumericAggState *state;
++	NumericLocalBuf buf;
+ 
+ 	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+ 
+@@ -5128,7 +5144,7 @@ numeric_avg_accum(PG_FUNCTION_ARGS)
+ 		state = makeNumericAggState(fcinfo, false);
+ 
+ 	if (!PG_ARGISNULL(1))
+-		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
++		do_numeric_accum(state, PG_GETARG_NUMERIC_LOCAL(1, &buf));
+ 
+ 	PG_RETURN_POINTER(state);
+ }
+@@ -5447,6 +5463,7 @@ Datum
+ numeric_accum_inv(PG_FUNCTION_ARGS)
+ {
+ 	NumericAggState *state;
++	NumericLocalBuf buf;
+ 
+ 	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+ 
+@@ -5457,7 +5474,7 @@ numeric_accum_inv(PG_FUNCTION_ARGS)
+ 	if (!PG_ARGISNULL(1))
+ 	{
+ 		/* If we fail to perform the inverse transition, return NULL */
+-		if (!do_numeric_discard(state, PG_GETARG_NUMERIC(1)))
++		if (!do_numeric_discard(state, PG_GETARG_NUMERIC_LOCAL(1, &buf)))
+ 			PG_RETURN_NULL();
+ 	}
+ 
+-- 
+2.56.1
+
