@@ -33,7 +33,7 @@ For every run we record:
 | bytes received by the client | interface counters on the client |
 | disk reads on the nodes | `/proc/diskstats` of the data array (md0) |
 | heap hit / read | deltas of `pg_statio_user_tables` on each node |
-| found / expected, false positives | the tool's report against the ground truth table `gt` |
+| found / expected, false positives | the tool's report against the ground truth table `gt` (and the rule in `gt_density`, 3.3) |
 | table state | `vm-check.sql` and `layout.sql` output on both nodes (section 5) |
 
 The last row is new. Without it, two runs of the same tool on "the same" data
@@ -115,11 +115,7 @@ About 420 GB of disk per node, plus WAL. Loading takes about an hour per node
 These are chosen to catch weak hashing: NULL → `''`, a trailing space and one
 float8 ULP are exactly what some tools miss.
 
-Optional (`sql/a/diffs-density.sql`): many differences in one table, either
-scattered over the key range or as one contiguous chunk. A block-hashing tool
-slows down with the number of *blocks* that mismatch, not with the number of
-rows. In an earlier ACE run, 0.0075% scattered differences took the time
-from 25.5 to 205.8 s, while 5% in one chunk took it only to 115.9 s.
+Many differing rows in one table are a separate test vector: see 3.3.
 
 ### 3.2 Family B: composite keys, random values
 
@@ -151,6 +147,40 @@ variant of a shape:
 | deleted | N·0.20, N·0.50, N·0.80 | ✓ | ✓ |
 | added (new random `r`, `h`, `v`) | N+1 … N+3 | ✓ | ✓ |
 
+### 3.3 Vector: share of differing rows
+
+The 10 differences per table in 3.1 and 3.2 measure the case "the tables are almost the same". This vector measures how a tool scales with the number of differing rows and with where they are. It uses family A and `sql/a/diffs-density.sql` on n2, on top of the 10 differences of `sql/a/diffs.sql`. n1 is not changed.
+
+| factor | levels |
+|---|---|
+| share of differing rows | 1%, 2%, 5%, 10%, 20% of `ROWS` (1M … 20M rows at 100M) |
+| position: uniform (`scatter`) | every (1/share)-th key over the whole key range |
+| position: edge (`head`) | one contiguous run of keys at the start of the table: ids 1 … `ROWS` × share |
+| table | narrow, wide, toast |
+
+That is 5 × 2 = 10 states per table. The base data of 3.1 (10 differences) is the 0% point of both curves.
+
+**Why two positions.** A block-hashing tool slows down with the number of *blocks* that mismatch, not with the number of rows. With 1% uniform, every key-range block of 100 or more rows already holds a differing row, so from 1% to 20% uniform the tool fetches every block and only the share of differing rows inside each block grows. With the edge position, only the blocks that cover the run mismatch, and their number grows with the share. A tool that reads every row anyway should show almost no difference between the two positions. In an earlier ACE run, 0.0075% uniform differences took the time from 25.5 to 205.8 s, while 5% in one contiguous run took it only to 115.9 s.
+
+**The other edge.** `tail` puts the run at the end of the key range: ids `ROWS` × (1 − share) + 1 … `ROWS`. A tool that cuts the table in key order and hands out blocks in that order meets the expensive blocks first with `head` and last with `tail`, which changes how the work overlaps. Run `tail` at least at one level (5%). If the result differs from `head` by more than the spread of the runs, run all levels for `tail` too and report both. The script also keeps `chunk` (a run right after the middle key) from earlier trials.
+
+Positions are in key order, not heap order. With `JOBS=16`, the ids 1 … 20M come from 4 of the 16 load ranges, and their pages are mixed with the pages of the other ranges, so a tool that reads the heap in physical order sees them spread over the whole table.
+
+**The change** is the last digit of one numeric column: `narrow.n2`, `wide.u3`, `toast.p1` (+1e-8, +1e-12 on `wide.u3`). It is the cheapest change to apply and to detect, and it does not touch TOAST values. Rows that are already in `gt` are skipped.
+
+**Ground truth.** `gt_density` holds the rule of the applied level: `lo`, `hi`, `step`. The expected result of a run is `gt` plus every id with `lo ≤ id ≤ hi` and `id % step = step / 2` (`step` = 1 for `head`, `tail` and `chunk`) that is not in `gt`. The script prints the number of changed rows (`n`), and the scorer must get the same number from the rule.
+
+**One level at a time.** The script refuses to apply a second level to a table while one is applied. `-v undo=1` with the same `tbl`, `mode` and `frac` restores the values (subtracting the same delta is exact for numeric), checks that every touched row equals its load formula again, and rebuilds the primary key. An undo that fails its check means the table is not in the base state any more: reload it.
+
+**Physical side effects.** The levels are applied with UPDATE. After loading, the pages are full, so the updates are not HOT: each new row version goes to another page, and the PK gets one more entry per changed row. At 20%, the n2 heap grows by up to about 20%, the changed rows leave their neighbours in key order, and the PK gets split pages over the changed range. This is what real updates do, so it is part of the measured case, but n2 now also differs from n1 in its layout. Record `layout.sql` on both nodes for every level. `undo` rebuilds the PK, but the heap keeps the moved rows. Run the levels of one position in ascending order. If the n2 heap is already more than 5% larger than the n1 heap before a level, reload the table on n2 first (4.1). Cold toast is the most sensitive case.
+
+**Volume and limits.** At 20% of 100M rows, the tool reports 20M rows. Before the series:
+
+* Check the row limits of each tool and set them above 20M plus the 10 base differences. Otherwise the rows the tool skips count as misses that come from the configuration. Example: ACE stops at `table_diff.max_diff_rows`, which is 1,000,000 by default.
+* Check the client disk for the reports. On wide, 20M rows with both versions of each row are 20 GB or more per report, depending on the format.
+* Run each tool under a memory limit, for example `systemd-run -p MemoryMax=… -p MemorySwapMax=0 -p OOMPolicy=continue`. Then an out-of-memory kill is a recorded result, not a machine that swaps for half an hour. In the October trial, ACE needed 38 GB RSS for 1M differing rows on wide and was killed at 2M on a 64 GB client.
+* Set a time limit per run (for example 2 hours) and record a run that hits it as such.
+
 ## 4. Building the data
 
 `psql` below means `psql -X -q -v ON_ERROR_STOP=1` with the usual `PG*`
@@ -169,7 +199,6 @@ for t in narrow wide toast; do
 done
 psql -f sql/a/pk.sql
 psql -f sql/a/diffs.sql                       # n2 only
-psql -v tbl=wide -v mode=scatter -v frac=0.0001 -f sql/a/diffs-density.sql   # n2, optional
 psql -f sql/common/finish.sql                 # only after ALL of the above has finished
 psql -f sql/common/vm-check.sql
 psql -f sql/common/layout.sql
@@ -181,8 +210,8 @@ psql -f sql/a/fingerprint.sql                 # optional, reads everything
   as in the main trial); `JOBS=1` gives a heap ordered by key. The contents
   are the same, the physical layout is not (see 5.1).
 * `spot-check.sql` compares the md5 of 18 rows with values recorded on
-  PostgreSQL 18.6. Run it before `diffs-density.sql`: a scattered run can
-  change one of its ids.
+  PostgreSQL 18.6. Run it before `diffs-density.sql` (4.3): every level
+  except `scatter` changes some of its ids. After `undo`, all 18 lines are OK again.
 * For a trial run, use a smaller `ROWS`. `diffs.sql` assumes 100M rows,
   so on a small copy only the added rows show up as differences.
 
@@ -223,6 +252,28 @@ psql -f sql/b/assert.sql
 psql -f sql/common/vm-check.sql
 psql -f sql/common/layout.sql
 ```
+
+### 4.3 Share of differing rows (vector 3.3)
+
+On the family A data of 4.1, one table at a time. `diffs-density.sql` and `finish.sql` run on n2; `vm-check.sql` and `layout.sql` run on both nodes.
+
+```sh
+t=wide                                        # narrow, wide, toast
+for mode in scatter head; do                  # plus tail at 0.05, see 3.3
+  for frac in 0.01 0.02 0.05 0.10 0.20; do
+    psql -v tbl=$t -v mode=$mode -v frac=$frac -f sql/a/diffs-density.sql          # n2
+    psql -f sql/common/finish.sql                                                  # n2
+    psql -f sql/common/vm-check.sql; psql -f sql/common/layout.sql                 # n1, n2: keep with the results
+    # ... the runs of this level (section 7) ...
+    psql -v tbl=$t -v mode=$mode -v frac=$frac -v undo=1 -f sql/a/diffs-density.sql   # n2
+    psql -f sql/common/finish.sql                                                  # n2
+  done
+done
+psql -f sql/a/spot-check.sql                  # n2: all 18 lines OK again
+```
+
+* `-v rows=N` must match the `ROWS` of the load (default 100000000).
+* Applying 20% takes minutes on narrow and much longer on toast. The time goes to the UPDATE and the new PK entries. Apply the level before the cache regime of the series (section 6), because the UPDATE fills the cache with n2 pages.
 
 ## 5. Physical state of the tables: layout and visibility map
 
@@ -367,12 +418,16 @@ A useful matrix for slicing-heavy tools is {full map, `every=2`, `every=1`} ×
    15 minutes once. Alternate the order of the tools between repetitions.
 3. Record the metrics from section 1, plus tool version or commit, its
    parameters and the network level.
-4. Score each run against `gt` on n2 (and `gt_density` if used): found,
-   missed, false positives. Every miss must be explained by category.
+4. Score each run against `gt` on n2, plus the rule in `gt_density` for the vector of 3.3: found,
+   missed, false positives. Every miss must be explained by category; the
+   rows of a density level are their own category (`density`).
 5. Keep raw logs next to the summary CSV. One line per run:
    `table, tool, config, rep, wall, client_cpu, rss, node_cpu_n1, node_cpu_n2,
    rx_bytes, disk_rd_n1, disk_rd_n2, heap_hit_n1, heap_read_n1, heap_hit_n2,
-   heap_read_n2, found, fp, vm_frac_n1, vm_frac_n2, cache, net`.
+   heap_read_n2, found, fp, vm_frac_n1, vm_frac_n2, cache, net, density_mode,
+   density_frac, heap_size_n2, pk_size_n2` (the last four are empty outside 3.3).
+   A run killed by the memory or time limit is a result: record it with its
+   wall time and the reason.
 
 Tool notes from previous trials:
 
@@ -407,6 +462,8 @@ Tool notes from previous trials:
   rendering are sensitive to these too: keep them identical on both nodes.
 * **Load parallelism changes the layout.** Keep `JOBS` fixed across the
   trials you want to compare, and record `layout.sql`.
+* **Density levels change n2, not only its values.** Every level of 3.3 moves rows and bloats the PK on n2, and an applied level stays until `undo`. Before a series, check that `gt_density` on n2 holds exactly the level you mean to measure (or nothing, for the base data). Also compare the n2 heap size with n1.
+* **Tool limits look like misses.** At 1M–20M differing rows, a row limit in a tool's configuration, an out-of-memory kill or a timeout ends the run early. Check the tool's log for each of them before you count missed rows (3.3).
 * **Leftover sessions.** A forgotten `psql` in a transaction on a node not only
   spoils the map (5.2) but also keeps dead tuples alive during the run.
 * **`fingerprint.sql` reads everything** (about 380 GB in family A). Do not run
@@ -420,7 +477,7 @@ Tool notes from previous trials:
 | `sql/a/load-{narrow,wide,toast}.sql` | both | one key range `:lo..:hi` |
 | `sql/a/pk.sql` | both | primary keys |
 | `sql/a/diffs.sql` | n2 | 30 differences, table `gt` |
-| `sql/a/diffs-density.sql` | n2, optional | scattered or contiguous mass differences, table `gt_density` |
+| `sql/a/diffs-density.sql` | n2 | vector 3.3: one level of differing rows (`scatter`, `head`, `tail`, `chunk`; `-v frac`), `-v undo=1` restores it; rule in table `gt_density` |
 | `sql/a/spot-check.sql` | both | md5 of 18 rows against recorded values |
 | `sql/a/fingerprint.sql` | both | full-table fingerprint; equal output = equal tables |
 | `sql/b/base-schema.sql` | both | unlogged base tables |
@@ -441,3 +498,5 @@ All scripts were run end to end on a small scale (family A with 200k rows,
 family B with 300k / 100k / 10k rows) on PostgreSQL 18.6. That covers both
 negative checks: `finish.sql` refusing to vacuum while another session held a
 snapshot, and `vm-check.sql` failing on a degraded table.
+
+`diffs-density.sql` was run on family A with 20k rows (`-v rows=20000`) on PostgreSQL 18. Every mode was applied and undone at 20% on wide and toast, and `scatter` and `head` were also run on narrow at 5% and 1%. The number of changed rows matched the rule each time, and every undo restored the load formula. The negative checks also worked: a second level on a table that already had one was refused, an undo with nothing applied was refused, and an undo after a row of the range had been changed by hand failed its check.
